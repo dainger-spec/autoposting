@@ -10,7 +10,6 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-DATA_DIR = BASE_DIR / "data"
 
 
 class ConfigError(Exception):
@@ -23,13 +22,14 @@ class Config:
     api_hash: str
     bot_token: str
     phone: str | None
+    session_string: str | None
     admin_ids: frozenset[int]
     default_chat: str | int | None
     tz: ZoneInfo
     late_send_minutes: int
     notify_success: bool
     posts_file: Path
-    data_dir: Path = DATA_DIR
+    data_dir: Path
 
     @property
     def state_file(self) -> Path:
@@ -50,11 +50,25 @@ def parse_chat(value: str) -> str | int | None:
     return value
 
 
-def _required(name: str) -> str:
-    value = os.getenv(name, "").strip()
+def _env(*names: str) -> str:
+    """Первое непустое значение из нескольких вариантов имени переменной."""
+    for name in names:
+        value = os.getenv(name, "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _required(*names: str) -> str:
+    value = _env(*names)
     if not value:
-        raise ConfigError(f"не задан параметр {name} в файле .env (пример — в .env.example)")
+        raise ConfigError(f"не задан параметр {names[0]} в файле .env (пример — в .env.example)")
     return value
+
+
+def _path(value: str) -> Path:
+    path = Path(value)
+    return path if path.is_absolute() else BASE_DIR / path
 
 
 def _int(name: str, default: int) -> int:
@@ -77,7 +91,8 @@ def _bool(name: str, default: bool) -> bool:
 def load_config() -> Config:
     load_dotenv(BASE_DIR / ".env")
 
-    api_id = _required("API_ID")
+    # TELEGRAM_API_ID / TELEGRAM_API_HASH — так эти параметры называет, например, bothost.ru
+    api_id = _required("API_ID", "TELEGRAM_API_ID")
     if not api_id.isdigit():
         raise ConfigError("API_ID должен быть числом")
 
@@ -95,19 +110,27 @@ def load_config() -> Config:
     except (ZoneInfoNotFoundError, ValueError):
         raise ConfigError(f"неизвестный часовой пояс TIMEZONE={tz_name!r}") from None
 
-    posts_file = Path(os.getenv("POSTS_FILE", "").strip() or "posts.json")
-    if not posts_file.is_absolute():
-        posts_file = BASE_DIR / posts_file
+    # На хостингах DATA_DIR указывает на постоянную папку (на bothost.ru — /app/data),
+    # тогда и posts.json по умолчанию хранится там, чтобы не пропадать при обновлениях.
+    data_dir = _path(_env("DATA_DIR") or "data")
+    if _env("POSTS_FILE"):
+        posts_file = _path(_env("POSTS_FILE"))
+    elif _env("DATA_DIR"):
+        posts_file = data_dir / "posts.json"
+    else:
+        posts_file = BASE_DIR / "posts.json"
 
     return Config(
         api_id=int(api_id),
-        api_hash=_required("API_HASH"),
+        api_hash=_required("API_HASH", "TELEGRAM_API_HASH"),
         bot_token=_required("BOT_TOKEN"),
-        phone=os.getenv("PHONE", "").strip() or None,
+        phone=_env("PHONE") or None,
+        session_string=_env("SESSION_STRING") or None,
         admin_ids=frozenset(admin_ids),
         default_chat=parse_chat(os.getenv("DEFAULT_CHAT", "")),
         tz=tz,
         late_send_minutes=max(1, _int("LATE_SEND_MINUTES", 10)),
         notify_success=_bool("NOTIFY_ON_SUCCESS", True),
         posts_file=posts_file,
+        data_dir=data_dir,
     )

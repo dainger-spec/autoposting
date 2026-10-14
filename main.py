@@ -2,16 +2,18 @@
 
 Запуск:  python main.py
 При первом запуске попросит номер телефона и код из Telegram (один раз).
+Для хостинга без консоли сначала выполните python login.py (см. README).
 """
 from __future__ import annotations
 
 import asyncio
-import getpass
 import logging
 import sys
 
 from telethon import TelegramClient
+from telethon.sessions import StringSession
 
+from autoposter.auth import login_user
 from autoposter.bot import ControlBot
 from autoposter.config import Config, ConfigError, load_config
 from autoposter.scheduler import Scheduler
@@ -25,21 +27,20 @@ async def run(cfg: Config) -> None:
     cfg.data_dir.mkdir(parents=True, exist_ok=True)
     store = PostStore(cfg.posts_file, cfg.state_file, cfg.media_dir)
 
-    # Две сессии: ваш аккаунт (от него идут посты) и бот (через него управление)
-    user = TelegramClient(str(cfg.data_dir / "user"), cfg.api_id, cfg.api_hash)
+    # Две сессии: ваш аккаунт (от него идут посты) и бот (через него управление).
+    # На хостинге без консоли вход в аккаунт задаётся строкой SESSION_STRING (см. login.py).
+    user_session = str(cfg.data_dir / "user")
+    if cfg.session_string:
+        try:
+            user_session = StringSession(cfg.session_string)
+        except Exception:
+            raise ConfigError("SESSION_STRING повреждена — скопируйте строку из python login.py целиком") from None
+    user = TelegramClient(user_session, cfg.api_id, cfg.api_hash)
     # имя сессии бота привязано к его ID, чтобы смена BOT_TOKEN не подхватила старого бота
     bot_id = cfg.bot_token.split(":", 1)[0]
     bot = TelegramClient(str(cfg.data_dir / f"bot_{bot_id}"), cfg.api_id, cfg.api_hash)
 
-    await user.start(
-        phone=cfg.phone or (lambda: input("Номер телефона вашего аккаунта (например +79991234567): ")),
-        code_callback=lambda: input("Код из Telegram: "),
-        password=lambda: getpass.getpass("Облачный пароль (двухэтапная аутентификация): "),
-    )
-    me = await user.get_me()
-    if me.bot:
-        raise ConfigError("в сессию аккаунта вошли ботом — удалите data/user.session и войдите по номеру телефона")
-
+    me = await login_user(user, cfg.phone, from_string=bool(cfg.session_string))
     await bot.start(bot_token=cfg.bot_token)
     bot_me = await bot.get_me()
 
