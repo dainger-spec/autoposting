@@ -62,7 +62,9 @@ def _env(*names: str) -> str:
 def _required(*names: str) -> str:
     value = _env(*names)
     if not value:
-        raise ConfigError(f"не задан параметр {names[0]} в файле .env (пример — в .env.example)")
+        where = " или ".join(names)
+        raise ConfigError(f"не задан параметр {where}: впишите его в файл .env или, на хостинге, "
+                          "в переменные окружения бота и перезапустите его")
     return value
 
 
