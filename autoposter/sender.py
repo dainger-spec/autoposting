@@ -7,7 +7,7 @@ import json
 import logging
 import time
 
-from telethon import TelegramClient, errors, types, utils
+from telethon import Button, TelegramClient, errors, types, utils
 from telethon.extensions import html as tl_html
 
 from .config import parse_chat
@@ -40,7 +40,7 @@ def content_key(post: dict) -> str:
     """Отпечаток содержимого: изменился — значит, в канале лежит устаревшая версия."""
     src = post.get("source") or {}
     data = [post["text"], [m["file"] for m in post["media"]], src.get("text_id"), src.get("media_ids"),
-            post["mix_letters"]]
+            post["mix_letters"], post["buttons"]]
     return hashlib.sha1(json.dumps(data, ensure_ascii=False).encode()).hexdigest()[:12]
 
 
@@ -95,11 +95,18 @@ async def _input_entities(client: TelegramClient, entities: list) -> list:
     return result
 
 
-async def send_post(client: TelegramClient, entity, post: dict, source: dict | None = None):
-    """Отправляет пост в entity. Используется и аккаунтом (публикация), и ботом (превью).
+def url_buttons(post: dict):
+    return [[Button.url(b["text"], b["url"]) for b in row] for row in post["buttons"]] or None
+
+
+async def send_post(client: TelegramClient, entity, post: dict, source: dict | None = None, *,
+                    as_bot: bool = False):
+    """Отправляет пост в entity. Используется и аккаунтом (публикация), и ботом (превью, канал).
 
     source — исходные сообщения из чата с ботом (см. Sender.load_source): если они есть,
     текст с разметкой и вложения копируются из них как есть, без повторной загрузки.
+    as_bot — отправляет бот: только он может добавить кнопки-ссылки, но не умеет
+    премиум-эмодзи (они станут обычными).
     """
     source = source or {}
     if source.get("text") is not None:
@@ -108,8 +115,13 @@ async def send_post(client: TelegramClient, entity, post: dict, source: dict | N
         text, entities = tl_html.parse(post["text"])
     if post["mix_letters"]:
         text = mix_letters(text, entities)
+    if as_bot:
+        entities = [e for e in entities if not isinstance(e, types.MessageEntityCustomEmoji)]
     entities = await _input_entities(client, entities)
     common = {"silent": post["silent"]}
+    # Кнопки может добавить только бот, и Telegram не показывает их под альбомами
+    if as_bot and post["buttons"] and len(post["media"]) <= 1:
+        common["buttons"] = url_buttons(post)
 
     if source.get("media"):
         media = source["media"]
@@ -148,11 +160,15 @@ class Sender:
         self._dialogs_loaded = False
         self.me_id: int | None = None
         self.bot_id: int | None = None
+        self.bot_client: TelegramClient | None = None
+        self.bot_username: str | None = None
         self._bot_peer = None
 
-    async def attach_bot(self, me, bot_me) -> None:
-        """Запоминает бота управления: посты копируются из ваших сообщений в чате с ним."""
+    async def attach_bot(self, me, bot_me, bot_client: TelegramClient | None = None) -> None:
+        """Запоминает бота управления: посты копируются из ваших сообщений в чате с ним,
+        а посты с кнопками бот сам публикует в канал."""
         self.me_id, self.bot_id = me.id, bot_me.id
+        self.bot_client, self.bot_username = bot_client, bot_me.username
         try:
             self._bot_peer = await self.client.get_input_entity(bot_me.username)
         except Exception as exc:
@@ -271,8 +287,21 @@ class Sender:
         if not force and self.channel_post_ready(post):
             return post["channel_post"]
         channel = self.channel
-        entity = await self._input_entity(channel)
-        result = await send_post(self.client, entity, post, await self.load_source(post))
+        source = await self.load_source(post)
+        if post["buttons"] and self.bot_client is not None:
+            # Кнопки умеет добавлять только бот: он публикует пост в канал, аккаунт потом пересылает.
+            # Вложения бот берёт из сохранённых файлов, текст с разметкой — из вашего сообщения.
+            bot_source = {"text": source["text"]} if source and source.get("text") else None
+            try:
+                entity = await self.bot_client.get_input_entity(channel)
+                result = await send_post(self.bot_client, entity, post, bot_source, as_bot=True)
+            except (ValueError, errors.ChatAdminRequiredError, errors.ChatWriteForbiddenError,
+                    errors.ChannelPrivateError) as exc:
+                raise SendError(f"чтобы у поста были кнопки, добавьте бота @{self.bot_username} в канал "
+                                f"админом с правом публикации ({describe_error(exc)})") from exc
+        else:
+            entity = await self._input_entity(channel)
+            result = await send_post(self.client, entity, post, source)
         messages = result if isinstance(result, list) else [result]
         info = {"chat": channel, "ids": [m.id for m in messages], "key": content_key(post)}
         if self.store is not None:

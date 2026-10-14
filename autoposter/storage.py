@@ -86,8 +86,24 @@ def normalize_post(raw: dict, post_id: int) -> dict:
         "until": _normalize_until(raw.get("until"), post_id),
         "source": _normalize_source(raw.get("source")),
         "via_channel": bool(raw.get("via_channel", True)),
+        "buttons": _normalize_buttons(raw.get("buttons")),
         "channel_post": _normalize_channel_post(raw.get("channel_post")),
     }
+
+
+def _normalize_buttons(raw) -> list[list[dict]]:
+    """Кнопки-ссылки под постом: [[{"text": "Сайт", "url": "https://..."}], ...] — ряды кнопок."""
+    rows = []
+    for row in raw or []:
+        if isinstance(row, dict):
+            row = [row]
+        if not isinstance(row, list):
+            continue
+        buttons = [{"text": str(b["text"]), "url": str(b["url"])}
+                   for b in row if isinstance(b, dict) and b.get("text") and b.get("url")]
+        if buttons:
+            rows.append(buttons)
+    return rows
 
 
 def _normalize_channel_post(raw) -> dict | None:

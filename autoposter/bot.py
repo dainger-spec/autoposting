@@ -5,6 +5,7 @@ import functools
 import html
 import logging
 import math
+import re
 import shutil
 import uuid
 from collections import Counter
@@ -119,6 +120,47 @@ def is_unsupported(msg) -> bool:
     return (msg.media is not None
             and not isinstance(msg.media, types.MessageMediaWebPage)
             and media_kind(msg) is None)
+
+
+BUTTONS_PROMPT = (
+    "🔘 <b>Кнопки со ссылками под постом</b>\n\n"
+    "Пришлите кнопки, каждую с новой строки, в формате <code>Текст - ссылка</code>.\n"
+    "Несколько кнопок в одном ряду разделите <code>|</code>. Пример:\n\n"
+    "<code>Наш сайт - https://example.com\n"
+    "Канал - t.me/my_channel | Чат - @my_chat</code>\n\n"
+    "Чтобы убрать все кнопки, пришлите <code>-</code>.\n\n"
+    "ℹ️ Обычный аккаунт Telegram не может отправлять кнопки, это умеют только боты. "
+    "Поэтому пост с кнопками публикует в канал <b>ваш бот</b>, а аккаунт пересылает его в чат "
+    "(кнопки при пересылке сохраняются). Нужно, чтобы посты шли через канал "
+    "(«⚙️ Настройки»), а бот был админом этого канала с правом публикации."
+)
+_BUTTON_RE = re.compile(r"(.*?)\s*[-—–]\s*(\S+)")
+
+
+def parse_buttons(text: str) -> list[list[dict]]:
+    """'Сайт - https://x.com | Чат - @chat' (по строке на ряд) -> ряды кнопок. Бросает ValueError."""
+    rows = []
+    for line in text.strip().splitlines():
+        row = []
+        for part in filter(None, (p.strip() for p in line.split("|"))):
+            match = _BUTTON_RE.fullmatch(part)
+            if not match or not match[1]:
+                raise ValueError(part)
+            url = match[2]
+            if url.startswith("@"):
+                url = "https://t.me/" + url[1:]
+            elif not re.match(r"(https?|tg)://", url):
+                url = "https://" + url
+            if not re.fullmatch(r"(https?://[\w-]+(\.[\w-]+)+\S*|tg://\S+)", url):
+                raise ValueError(part)
+            row.append({"text": match[1][:64], "url": url})
+        if row:
+            if len(row) > 8:
+                raise ValueError(f"в одном ряду больше 8 кнопок: {line}")
+            rows.append(row)
+    if not rows:
+        raise ValueError("пусто")
+    return rows
 
 
 def cancel_buttons():
@@ -455,6 +497,14 @@ class ControlBot:
             lines.append(f"📢 Пересылается из канала {await self.chat_title_html(self.sender.channel)} ({state})")
         elif post["source"] and post["source"]["peer"] == self.sender.bot_id:
             lines.append("📨 Отправляется копией вашего сообщения")
+        if post["buttons"]:
+            count = sum(len(row) for row in post["buttons"])
+            line = f"🔘 Кнопки: {count}"
+            if not self.sender.uses_channel(post):
+                line += " — ⚠️ появятся, только если пост идёт через канал («⚙️ Настройки»)"
+            elif len(post["media"]) > 1:
+                line += " — ⚠️ под альбомами Telegram кнопки не показывает"
+            lines.append(line)
         when = next_run(post, now)
         if when:
             lines.append(f"⏭ Следующая публикация: <b>{format_when(when, now)}</b>")
@@ -478,7 +528,8 @@ class ControlBot:
              Button.inline("📅 Дни", f"edit:{pid}:days")],
             [Button.inline("⏳ Срок", f"edit:{pid}:until"),
              Button.inline("💬 Чат", f"edit:{pid}:chat")],
-            [Button.inline("🔕 Без звука" if post["silent"] else "🔔 Со звуком", f"silent:{pid}")],
+            [Button.inline("🔘 Кнопки", f"edit:{pid}:buttons"),
+             Button.inline("🔕 Без звука" if post["silent"] else "🔔 Со звуком", f"silent:{pid}")],
         ]
         rows[-1].append(Button.inline("🔤 Подмена букв: " + ("вкл" if post["mix_letters"] else "выкл"), f"mix:{pid}"))
         extra = []
@@ -594,6 +645,8 @@ class ControlBot:
             await self.handle_until_text(event, state, text)
         elif step == "set_channel":
             await self.handle_channel_text(event, text)
+        elif step == "edit_buttons":
+            await self.handle_buttons_text(event, state, text)
 
     async def start_new(self, event, *, edit: bool = False) -> None:
         self.drop_state(event.sender_id)
@@ -701,6 +754,26 @@ class ControlBot:
         self.store.update(state["post_id"], times=times)
         await self.show_card(event, state["post_id"], note="✅ Время обновлено")
 
+    async def handle_buttons_text(self, event, state: dict, text: str) -> None:
+        if text in ("-", "—", "нет", "убрать"):
+            buttons, note = [], "✅ Кнопки убраны"
+        else:
+            try:
+                buttons = parse_buttons(text)
+            except ValueError as exc:
+                await event.respond(
+                    f"⚠️ Не понял кнопку: <code>{html.escape(str(exc))}</code>\n"
+                    "Формат: <code>Текст - https://ссылка</code>, по одной кнопке на строку.",
+                    buttons=cancel_buttons())
+                return
+            note = f"✅ Кнопки сохранены: {sum(len(row) for row in buttons)}"
+        self.states.pop(event.sender_id, None)
+        post = self.store.update(state["post_id"], buttons=buttons)
+        if post is None:
+            return await self.show_list(event, note="⚠️ Пост не найден — возможно, его удалили.")
+        note += await self.publish_to_channel(post)
+        await self.show_card(event, post["id"], note=note)
+
     async def handle_chat_text(self, event, state: dict, text: str) -> None:
         if not text:
             return await self.ask_chat(event)
@@ -765,7 +838,8 @@ class ControlBot:
             draft = state["draft"]
             post = self.store.add(text=draft["text"], media=draft["media"], times=draft["times"],
                                   chat=draft["chat"], source=draft.get("source"), until=value)
-            note = "✅ Пост создан и включён. Дни недели и остальное можно настроить кнопками ниже."
+            note = ("✅ Пост создан и включён. Дни недели, кнопки со ссылками и остальное "
+                    "можно настроить кнопками ниже.")
             if post["source"]:
                 note += "\n📨 Не удаляйте исходное сообщение из этого чата: пост копируется из него."
             note += await self.publish_to_channel(post)
@@ -946,6 +1020,11 @@ class ControlBot:
             await self.ask_chat(event, edit=True)
         elif field == "days":
             await self.show_days(event, post)
+        elif field == "buttons":
+            self.states[user_id] = {"step": "edit_buttons", "post_id": pid}
+            current = "\n".join(" | ".join(f"{b['text']} - {b['url']}" for b in row) for row in post["buttons"])
+            prefix = f"Сейчас:\n<code>{html.escape(current)}</code>\n\n" if current else ""
+            await self.reply(event, prefix + BUTTONS_PROMPT, cancel_buttons(), edit=True)
         elif field == "until":
             self.states[user_id] = {"step": "edit_until", "post_id": pid}
             current = format_until(post, datetime.now(self.cfg.tz).date())
@@ -955,7 +1034,7 @@ class ControlBot:
         await event.answer("Готовлю превью…")
         await self.reply(event, f"👁 Превью поста #{post['id']} — так он будет выглядеть:", edit=True)
         try:
-            await send_post(self.bot, await event.get_input_chat(), post)
+            await send_post(self.bot, await event.get_input_chat(), post, as_bot=True)
         except Exception as exc:
             await event.respond(f"❌ Превью не получилось: {html.escape(describe_error(exc))}")
         await self.show_card(event, post["id"])
