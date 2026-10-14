@@ -58,6 +58,7 @@ async def run(cfg: Config) -> None:
 
     try:
         sender = Sender(user, cfg.default_chat)
+        await sender.attach_bot(me, bot_me)
         admins = {me.id, *cfg.admin_ids} | ({owner_id} if owner_id else set())
         control = ControlBot(bot, cfg, store, sender, admins=admins)
         await control.setup()

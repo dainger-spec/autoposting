@@ -325,6 +325,8 @@ class ControlBot:
         ]
         if post["media"]:
             lines.append(f"📎 Вложения: {media_summary(post['media'])}")
+        if post["source"] and post["source"]["peer"] == self.sender.bot_id:
+            lines.append("📨 Отправляется копией вашего сообщения")
         when = next_run(post, now)
         if when:
             lines.append(f"⏭ Следующая публикация: <b>{format_when(when, now)}</b>")
@@ -349,7 +351,7 @@ class ControlBot:
             [Button.inline("💬 Чат", f"edit:{pid}:chat"),
              Button.inline("🔕 Без звука" if post["silent"] else "🔔 Со звуком", f"silent:{pid}")],
         ]
-        extra = []
+        extra = [Button.inline("🔤 Подмена букв: " + ("вкл" if post["mix_letters"] else "выкл"), f"mix:{pid}")]
         if not post["media"]:
             state = "вкл" if post["link_preview"] else "выкл"
             extra.append(Button.inline(f"🔗 Превью ссылок: {state}", f"lp:{pid}"))
@@ -478,11 +480,20 @@ class ControlBot:
                 "Пришлите текст, фото, видео, GIF, файл, аудио или голосовое.",
                 buttons=cancel_buttons())
             return
-        text = next((m.text for m in messages if m.text and m.text.strip()), "")
+        text_message = next((m for m in messages if m.text and m.text.strip()), None)
+        text = text_message.text if text_message else ""
         media_messages = [m for m in messages if media_kind(m)]
         if not text and not media_messages:
             await event.respond("⚠️ Сообщение пустое — пришлите текст или медиа.", buttons=cancel_buttons())
             return
+
+        # Если пишет сам владелец аккаунта, пост потом копируется из его сообщения как есть
+        # (те же файлы, GIF, кружки, премиум-эмодзи, спойлеры). Скачанные файлы — запасной вариант.
+        source_ids = None
+        if user_id == self.sender.me_id:
+            found = await self.sender.find_source(messages)
+            if found:
+                source_ids = dict(zip((m.id for m in messages), found))
 
         media = []
         if media_messages:
@@ -499,8 +510,15 @@ class ControlBot:
             self.store.release_media(media)
             return
 
+        src_text_id = source_ids.get(text_message.id) if source_ids and text_message else None
+        src_media_ids = [source_ids[m.id] for m in media_messages] if source_ids else []
+
         if state["step"] == "new_content":
-            state["draft"] = {"text": text, "media": media}
+            source = None
+            if source_ids:
+                source = {"peer": self.sender.bot_id, "text_id": src_text_id, "media_ids": src_media_ids,
+                          "media_files": [m["file"] for m in media]}
+            state["draft"] = {"text": text, "media": media, "source": source}
             state["step"] = "new_times"
             await event.respond(TIMES_PROMPT.format(tz=self.cfg.tz.key), buttons=cancel_buttons())
             return
@@ -509,10 +527,16 @@ class ControlBot:
         self.states.pop(user_id, None)
         old = self.store.get(post_id)
         fields = {}
+        source = dict((old or {}).get("source") or {})
+        if source.get("peer") != self.sender.bot_id:
+            source = {"peer": self.sender.bot_id, "text_id": None, "media_ids": [], "media_files": []}
         if text:
             fields["text"] = text
+            source["text_id"] = src_text_id
         if media:
             fields["media"] = media
+            source.update(media_ids=src_media_ids, media_files=[m["file"] for m in media])
+        fields["source"] = source
         if old is None or self.store.update(post_id, **fields) is None:
             self.store.release_media(media)
             return await self.show_list(event, note="⚠️ Пост не найден — возможно, его удалили.")
@@ -554,8 +578,11 @@ class ControlBot:
         self.states.pop(event.sender_id, None)
         if state["step"] == "new_chat":
             draft = state["draft"]
-            post = self.store.add(text=draft["text"], media=draft["media"], times=draft["times"], chat=chat)
+            post = self.store.add(text=draft["text"], media=draft["media"], times=draft["times"],
+                                  chat=chat, source=draft.get("source"))
             note = "✅ Пост создан и включён. Дни недели и остальное можно настроить кнопками ниже."
+            if post["source"]:
+                note += "\n📨 Не удаляйте исходное сообщение из этого чата: пост копируется из него."
             return await self.show_card(event, post["id"], note=note, edit=edit)
         self.store.update(state["post_id"], chat=chat)
         await self.show_card(event, state["post_id"], note="✅ Чат обновлён", edit=edit)
@@ -613,6 +640,10 @@ class ControlBot:
             await self.show_card(event, pid, edit=True)
         elif action == "silent":
             self.store.update(pid, silent=not post["silent"])
+            await self.show_card(event, pid, edit=True)
+        elif action == "mix":
+            post = self.store.update(pid, mix_letters=not post["mix_letters"])
+            await event.answer("Подмена букв " + ("включена" if post["mix_letters"] else "выключена"))
             await self.show_card(event, pid, edit=True)
         elif action == "lp":
             self.store.update(pid, link_preview=not post["link_preview"])

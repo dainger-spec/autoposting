@@ -82,6 +82,25 @@ def normalize_post(raw: dict, post_id: int) -> dict:
         "enabled": bool(raw.get("enabled", True)),
         "silent": bool(raw.get("silent", False)),
         "link_preview": bool(raw.get("link_preview", True)),
+        "mix_letters": bool(raw.get("mix_letters", True)),
+        "source": _normalize_source(raw.get("source")),
+    }
+
+
+def _int_or_none(value) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _normalize_source(raw) -> dict | None:
+    """Ссылка на исходное сообщение в вашем чате с ботом — из него пост копируется как есть."""
+    if not isinstance(raw, dict) or _int_or_none(raw.get("peer")) is None:
+        return None
+    media_ids = [i for i in raw.get("media_ids") or [] if _int_or_none(i) is not None]
+    return {
+        "peer": raw["peer"],
+        "text_id": _int_or_none(raw.get("text_id")),
+        "media_ids": media_ids,
+        "media_files": [str(f) for f in raw.get("media_files") or []],
     }
 
 

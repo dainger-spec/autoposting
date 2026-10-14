@@ -6,8 +6,10 @@ import logging
 import time
 
 from telethon import TelegramClient, errors, types, utils
+from telethon.extensions import html as tl_html
 
 from .config import parse_chat
+from .letters import mix_letters
 from .storage import media_path
 
 log = logging.getLogger(__name__)
@@ -55,9 +57,49 @@ def describe_error(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {exc}"
 
 
-async def send_post(client: TelegramClient, entity, post: dict):
-    """Отправляет пост в entity. Используется и аккаунтом (публикация), и ботом (превью)."""
-    text = post["text"]
+def _file_kind(msg) -> str | None:
+    if isinstance(msg.media, types.MessageMediaPhoto):
+        return "photo"
+    if isinstance(msg.media, types.MessageMediaDocument):
+        return "document"
+    return None
+
+
+async def _input_entities(client: TelegramClient, entities: list) -> list:
+    """Упоминания пользователей по ID нужно передавать в Telegram в «input»-виде."""
+    result = []
+    for entity in entities:
+        if isinstance(entity, types.MessageEntityMentionName):
+            try:
+                user = await client.get_input_entity(entity.user_id)
+            except (ValueError, TypeError):
+                continue  # не знаем такого пользователя — оставляем просто текст
+            entity = types.InputMessageEntityMentionName(entity.offset, entity.length, user)
+        result.append(entity)
+    return result
+
+
+async def send_post(client: TelegramClient, entity, post: dict, source: dict | None = None):
+    """Отправляет пост в entity. Используется и аккаунтом (публикация), и ботом (превью).
+
+    source — исходные сообщения из чата с ботом (см. Sender.load_source): если они есть,
+    текст с разметкой и вложения копируются из них как есть, без повторной загрузки.
+    """
+    source = source or {}
+    if source.get("text") is not None:
+        text, entities = source["text"].message or "", list(source["text"].entities or [])
+    else:
+        text, entities = tl_html.parse(post["text"])
+    if post["mix_letters"]:
+        text = mix_letters(text, entities)
+    entities = await _input_entities(client, entities)
+    common = {"silent": post["silent"]}
+
+    if source.get("media"):
+        media = source["media"]
+        return await client.send_file(entity, media[0] if len(media) == 1 else media, caption=text,
+                                      formatting_entities=entities, parse_mode=None, **common)
+
     files = [media_path(m["file"]) for m in post["media"]]
     for path in files:
         if not path.is_file():
@@ -66,12 +108,10 @@ async def send_post(client: TelegramClient, entity, post: dict):
     if not files:
         if not text.strip():
             raise SendError("пост пустой — нет ни текста, ни вложений")
-        return await client.send_message(
-            entity, text, parse_mode="html",
-            link_preview=post["link_preview"], silent=post["silent"],
-        )
+        return await client.send_message(entity, text, formatting_entities=entities,
+                                         link_preview=post["link_preview"], **common)
 
-    options = {"caption": text, "parse_mode": "html", "silent": post["silent"]}
+    options = {"caption": text, "formatting_entities": entities, "parse_mode": None, **common}
     if len(files) == 1:
         options.update(_KIND_OPTIONS.get(post["media"][0]["type"], {}))
         return await client.send_file(entity, str(files[0]), **options)
@@ -88,6 +128,63 @@ class Sender:
         self.default_chat = default_chat
         self._titles: dict = {}
         self._dialogs_loaded = False
+        self.me_id: int | None = None
+        self.bot_id: int | None = None
+        self._bot_peer = None
+
+    async def attach_bot(self, me, bot_me) -> None:
+        """Запоминает бота управления: посты копируются из ваших сообщений в чате с ним."""
+        self.me_id, self.bot_id = me.id, bot_me.id
+        try:
+            self._bot_peer = await self.client.get_input_entity(bot_me.username)
+        except Exception as exc:
+            log.warning("Аккаунт не видит бота @%s: %s", bot_me.username, exc)
+
+    async def find_source(self, bot_messages: list) -> list[int] | None:
+        """ID тех же сообщений, но со стороны вашего аккаунта (в личке у каждого свои ID)."""
+        if self._bot_peer is None:
+            return None
+        try:
+            candidates = await self.client.get_messages(self._bot_peer, limit=50)
+        except Exception as exc:
+            log.warning("Не удалось прочитать чат с ботом: %s", exc)
+            return None
+        candidates = sorted((c for c in candidates if c.out), key=lambda c: c.id)
+        ids: list[int] = []
+        for msg in bot_messages:
+            match = next((c for c in candidates
+                          if c.id not in ids and c.date == msg.date
+                          and (c.message or "") == (msg.message or "")
+                          and _file_kind(c) == _file_kind(msg)), None)
+            if match is None:
+                return None
+            ids.append(match.id)
+        return ids
+
+    async def load_source(self, post: dict) -> dict | None:
+        """Исходные сообщения поста, если они ещё есть в чате с ботом и не устарели."""
+        src = post.get("source")
+        if not src or src["peer"] != self.bot_id or self._bot_peer is None:
+            return None
+        use_text = src["text_id"] is not None
+        # вложения поменяли вручную в posts.json — тогда берём файлы
+        use_media = bool(src["media_ids"]) and src["media_files"] == [m["file"] for m in post["media"]]
+        ids = ([src["text_id"]] if use_text else []) + (src["media_ids"] if use_media else [])
+        if not ids:
+            return None
+        try:
+            found = {m.id: m for m in await self.client.get_messages(self._bot_peer, ids=ids) if m}
+        except Exception as exc:
+            log.warning("Не удалось получить исходное сообщение поста #%s: %s", post["id"], exc)
+            return None
+        result = {}
+        text_msg = found.get(src["text_id"]) if use_text else None
+        # текст поменяли вручную в posts.json — тогда берём его оттуда
+        if text_msg is not None and tl_html.unparse(text_msg.message or "", text_msg.entities or []) == post["text"]:
+            result["text"] = text_msg
+        if use_media and all(found.get(i) and _file_kind(found[i]) for i in src["media_ids"]):
+            result["media"] = [found[i].media for i in src["media_ids"]]
+        return result
 
     def target(self, post: dict):
         return post["chat"] if post["chat"] is not None else self.default_chat
@@ -109,14 +206,15 @@ class Sender:
         if chat is None:
             raise SendError("не указан чат: выберите его в посте или задайте DEFAULT_CHAT в .env")
         entity = await self._input_entity(chat)
+        source = await self.load_source(post)
         try:
-            return await send_post(self.client, entity, post)
+            return await send_post(self.client, entity, post, source)
         except errors.FloodWaitError as exc:
             if exc.seconds > 120:
                 raise
             log.warning("FloodWait %s с, жду и повторяю", exc.seconds)
             await asyncio.sleep(exc.seconds + 1)
-            return await send_post(self.client, entity, post)
+            return await send_post(self.client, entity, post, source)
 
     async def lookup(self, text: str) -> tuple[str | int, str]:
         """Находит чат по тому, что прислал пользователь. Возвращает (chat, название)."""
