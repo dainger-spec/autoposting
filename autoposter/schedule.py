@@ -1,6 +1,7 @@
 """Расписание: разбор времени и дней, поиск постов, которые пора отправить."""
 from __future__ import annotations
 
+import calendar
 import re
 from datetime import date, datetime, time, timedelta
 
@@ -16,6 +17,18 @@ DAY_ALIASES = {
 }
 
 _TIME_RE = re.compile(r"(\d{1,2})[:.](\d{2})")
+_DATE_RE = re.compile(r"(\d{1,2})[./-](\d{1,2})(?:[./-](\d{2}|\d{4}))?")
+
+# Сроки публикации: код -> (подпись, месяцев, дней)
+PERIODS = {
+    "w1": ("1 неделя", 0, 7),
+    "w2": ("2 недели", 0, 14),
+    "m1": ("1 месяц", 1, 0),
+    "m2": ("2 месяца", 2, 0),
+    "m3": ("3 месяца", 3, 0),
+    "m6": ("6 месяцев", 6, 0),
+    "y1": ("1 год", 12, 0),
+}
 
 
 def parse_time(value: str) -> str:
@@ -69,6 +82,50 @@ def format_days(days: list[int]) -> str:
     return ", ".join(DAY_NAMES[d - 1] for d in days)
 
 
+def add_months(day: date, months: int) -> date:
+    year, month = divmod(day.month - 1 + months, 12)
+    year, month = day.year + year, month + 1
+    return day.replace(year=year, month=month, day=min(day.day, calendar.monthrange(year, month)[1]))
+
+
+def period_end(start: date, code: str) -> date:
+    """Последний день публикации (включительно), если начать сегодня: 1 неделя = 7 дней."""
+    _, months, days = PERIODS[code]
+    return add_months(start, months) + timedelta(days=days - 1)
+
+
+def parse_date(text: str, today: date) -> date:
+    """'31.12.2026', '31.12.26', '31.12' (ближайшее такое число). Бросает ValueError."""
+    match = _DATE_RE.fullmatch(text.strip())
+    if not match:
+        raise ValueError(text)
+    day, month = int(match[1]), int(match[2])
+    if match[3]:
+        year = int(match[3]) + (2000 if len(match[3]) == 2 else 0)
+        return date(year, month, day)
+    result = date(today.year, month, day)
+    return result if result >= today else date(today.year + 1, month, day)
+
+
+def until_date(post: dict) -> date | None:
+    return date.fromisoformat(post["until"]) if post.get("until") else None
+
+
+def is_expired(post: dict, today: date) -> bool:
+    until = until_date(post)
+    return until is not None and today > until
+
+
+def format_until(post: dict, today: date) -> str:
+    until = until_date(post)
+    if until is None:
+        return "♾ пока не выключу"
+    if until < today:
+        return f"⌛️ закончился {until:%d.%m.%Y}"
+    left = (until - today).days + 1
+    return f"до {until:%d.%m.%Y} включительно (осталось дней: {left})"
+
+
 def _slot(day: date, hhmm: str, tz) -> datetime:
     hours, minutes = map(int, hhmm.split(":"))
     return datetime.combine(day, time(hours, minutes), tzinfo=tz)
@@ -81,9 +138,10 @@ def due_slots(post: dict, now: datetime, late_minutes: int) -> list[tuple[str, s
     если проверка случилась уже после полуночи.
     """
     late = timedelta(minutes=late_minutes)
+    until = until_date(post)
     result = []
     for day in (now.date() - timedelta(days=1), now.date()):
-        if day.isoweekday() not in post["days"]:
+        if day.isoweekday() not in post["days"] or (until and day > until):
             continue
         for hhmm in post["times"]:
             slot = _slot(day, hhmm, now.tzinfo)
@@ -95,8 +153,11 @@ def due_slots(post: dict, now: datetime, late_minutes: int) -> list[tuple[str, s
 def next_run(post: dict, now: datetime) -> datetime | None:
     if not post["enabled"] or not post["times"] or not post["days"]:
         return None
+    until = until_date(post)
     for offset in range(8):
         day = now.date() + timedelta(days=offset)
+        if until and day > until:
+            return None
         if day.isoweekday() not in post["days"]:
             continue
         for hhmm in post["times"]:

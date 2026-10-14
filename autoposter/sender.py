@@ -161,6 +161,26 @@ class Sender:
             ids.append(match.id)
         return ids
 
+    async def delete_source(self, posts: list[dict], keep: list[dict]) -> None:
+        """Удаляет исходные сообщения удалённых постов из чата с ботом (кроме нужных другим постам)."""
+        if self._bot_peer is None:
+            return
+
+        def ids_of(post):
+            src = post.get("source")
+            if not src or src["peer"] != self.bot_id:
+                return set()
+            return {i for i in [src["text_id"], *src["media_ids"]] if i}
+
+        in_use = set().union(*map(ids_of, keep))
+        ids = set().union(*map(ids_of, posts)) - in_use
+        if not ids:
+            return
+        try:
+            await self.client.delete_messages(self._bot_peer, sorted(ids))
+        except Exception as exc:
+            log.warning("Не удалось удалить исходные сообщения из чата с ботом: %s", exc)
+
     async def load_source(self, post: dict) -> dict | None:
         """Исходные сообщения поста, если они ещё есть в чате с ботом и не устарели."""
         src = post.get("source")

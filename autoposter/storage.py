@@ -14,7 +14,7 @@ from datetime import date, timedelta
 from pathlib import Path
 
 from .config import BASE_DIR, parse_chat
-from .schedule import ALL_DAYS, parse_day, parse_time
+from .schedule import ALL_DAYS, parse_date, parse_day, parse_time
 
 log = logging.getLogger(__name__)
 
@@ -83,8 +83,24 @@ def normalize_post(raw: dict, post_id: int) -> dict:
         "silent": bool(raw.get("silent", False)),
         "link_preview": bool(raw.get("link_preview", True)),
         "mix_letters": bool(raw.get("mix_letters", True)),
+        "until": _normalize_until(raw.get("until"), post_id),
         "source": _normalize_source(raw.get("source")),
     }
+
+
+def _normalize_until(raw, post_id: int) -> str | None:
+    """Последний день публикации: '2026-12-31' или '31.12.2026'; пусто — бессрочно."""
+    if not raw:
+        return None
+    try:
+        return date.fromisoformat(str(raw)).isoformat()
+    except ValueError:
+        pass
+    try:
+        return parse_date(str(raw), date.today()).isoformat()
+    except ValueError:
+        log.warning("Пост #%s: неверная дата окончания %r — пост будет бессрочным", post_id, raw)
+        return None
 
 
 def _int_or_none(value) -> int | None:

@@ -5,11 +5,11 @@ import asyncio
 import html
 import logging
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Awaitable, Callable
 
 from .config import Config
-from .schedule import due_slots
+from .schedule import due_slots, is_expired, until_date
 from .sender import RETRYABLE, Sender, describe_error
 from .storage import PostStore
 
@@ -42,9 +42,22 @@ class Scheduler:
         for post in self.store.all():
             if not post["enabled"]:
                 continue
+            # выключаем, когда прошли и последний день, и запас на опоздание после полуночи
+            if is_expired(post, (now - timedelta(minutes=self.cfg.late_send_minutes)).date()):
+                await self._expire(post)
+                continue
             for day, hhmm in due_slots(post, now, self.cfg.late_send_minutes):
                 if not self.store.was_sent(post["id"], day, hhmm):
                     await self._publish(post, day, hhmm)
+
+    async def _expire(self, post: dict) -> None:
+        self.store.update(post["id"], enabled=False)
+        until = until_date(post)
+        log.info("Пост #%s: срок публикации закончился (%s) — выключен", post["id"], until)
+        await self.notify(
+            f"⏹ Срок публикации поста #{post['id']} закончился ({until:%d.%m.%Y}) — пост выключен.\n"
+            "Продлить можно в карточке поста кнопкой «⏳ Срок»."
+        )
 
     async def _publish(self, post: dict, day: str, hhmm: str) -> None:
         key = (post["id"], day, hhmm)

@@ -15,14 +15,15 @@ from telethon import Button, TelegramClient, errors, events, functions, types, u
 from telethon.extensions import html as tl_html
 
 from .config import BASE_DIR, Config
-from .schedule import (ALL_DAYS, DAY_NAMES, WEEKDAYS, WEEKEND, format_days, format_when,
-                       next_run, parse_times)
+from .schedule import (ALL_DAYS, DAY_NAMES, PERIODS, WEEKDAYS, WEEKEND, format_days, format_until,
+                       format_when, is_expired, next_run, parse_date, parse_times, period_end, until_date)
 from .sender import Sender, SendError, describe_error, send_post
 from .storage import PostStore
 
 log = logging.getLogger(__name__)
 
 PAGE_SIZE = 8
+LIST_VIEWS = {"all": "Все", "on": "🟢 Вкл", "off": "⏸ Выкл"}
 BODY_PREVIEW_LIMIT = 3000
 
 KIND_NAMES = {
@@ -241,7 +242,7 @@ class ControlBot:
             "Публикации идут с вашего аккаунта по расписанию."
         )
         buttons = [
-            [Button.inline("📋 Мои посты", b"list:0"), Button.inline("➕ Новый пост", b"new")],
+            [Button.inline("📋 Мои посты", b"list:all:0"), Button.inline("➕ Новый пост", b"new")],
             [Button.inline("ℹ️ Статус", b"status"), Button.inline("❓ Помощь", b"help")],
         ]
         await self.reply(event, text, buttons, edit=edit)
@@ -282,10 +283,14 @@ class ControlBot:
     def post_label(self, post: dict) -> str:
         icon = "🟢" if post["enabled"] else "⏸"
         times = ", ".join(post["times"]) or "без времени"
-        preview = short(plain(post["text"]), 28) if post["text"].strip() else f"[{media_summary(post['media'])}]"
-        return short(f"{icon} #{post['id']} · {times} · {preview}", 64)
+        preview = short(plain(post["text"]), 24) if post["text"].strip() else f"[{media_summary(post['media'])}]"
+        until = until_date(post)
+        term = f" · до {until:%d.%m}" if until else ""
+        return short(f"{icon} #{post['id']} · {times}{term} · {preview}", 64)
 
-    async def show_list(self, event, page: int = 0, *, edit: bool = False, note: str | None = None) -> None:
+    async def show_list(self, event, view: str = "all", page: int = 0, *,
+                        edit: bool = False, note: str | None = None) -> None:
+        """Панель постов: вкладки «все / включённые / выключенные» и массовые действия."""
         self.store.reload()
         posts = self.store.all()
         prefix = f"{note}\n\n" if note else ""
@@ -294,23 +299,82 @@ class ControlBot:
             await self.reply(event, prefix + "📋 Постов пока нет — создайте первый!", buttons, edit=edit)
             return
 
-        pages = math.ceil(len(posts) / PAGE_SIZE)
+        view = view if view in LIST_VIEWS else "all"
+        groups = {"all": posts, "on": [p for p in posts if p["enabled"]], "off": [p for p in posts if not p["enabled"]]}
+        shown = groups[view]
+        tabs = [Button.inline(("• " if v == view else "") + f"{title} ({len(groups[v])})", f"list:{v}:0")
+                for v, title in LIST_VIEWS.items()]
+        rows = [tabs]
+
+        pages = max(1, math.ceil(len(shown) / PAGE_SIZE))
         page = min(max(page, 0), pages - 1)
-        chunk = posts[page * PAGE_SIZE:(page + 1) * PAGE_SIZE]
-        rows = [[Button.inline(self.post_label(p), f"post:{p['id']}")] for p in chunk]
+        rows += [[Button.inline(self.post_label(p), f"post:{p['id']}")]
+                 for p in shown[page * PAGE_SIZE:(page + 1) * PAGE_SIZE]]
         if pages > 1:
             nav = []
             if page > 0:
-                nav.append(Button.inline("◀️", f"list:{page - 1}"))
+                nav.append(Button.inline("◀️", f"list:{view}:{page - 1}"))
             nav.append(Button.inline(f"{page + 1} / {pages}", b"noop"))
             if page < pages - 1:
-                nav.append(Button.inline("▶️", f"list:{page + 1}"))
+                nav.append(Button.inline("▶️", f"list:{view}:{page + 1}"))
             rows.append(nav)
+        if view == "on" and shown:
+            rows.append([Button.inline("⏸ Выключить все", b"bulk:off")])
+        if view == "off" and shown:
+            rows.append([Button.inline("▶️ Включить все", b"bulk:on"),
+                         Button.inline("🗑 Удалить все", b"bulk:del")])
         rows.append([Button.inline("➕ Новый пост", b"new"), Button.inline("« Меню", b"menu")])
-        active = sum(p["enabled"] for p in posts)
-        text = (prefix + f"<b>📋 Посты</b> — всего {len(posts)}, активных {active}\n"
-                "Нажмите на пост, чтобы открыть его настройки.")
+
+        text = (prefix + "<b>📋 Панель постов</b>\n"
+                f"🟢 Включено: <b>{len(groups['on'])}</b> · ⏸ Выключено: <b>{len(groups['off'])}</b>\n\n")
+        text += ("Нажмите на пост, чтобы открыть его настройки." if shown
+                 else "В этой вкладке постов нет.")
         await self.reply(event, text, rows, edit=edit)
+
+    async def show_bulk_confirm(self, event, op: str) -> None:
+        posts = self.store.all()
+        targets = [p for p in posts if p["enabled"]] if op == "off" else [p for p in posts if not p["enabled"]]
+        questions = {
+            "off": f"⏸ Выключить все включённые посты ({len(targets)})?",
+            "on": f"▶️ Включить все выключенные посты ({len(targets)})?\n"
+                  "У постов с закончившимся сроком срок станет «пока не выключу».",
+            "del": f"🗑 Удалить все выключенные посты ({len(targets)}) полностью?\n"
+                   "Удалятся сами посты, их файлы, история отправок и исходные сообщения в этом чате. "
+                   "Отменить будет нельзя.",
+        }
+        back = "on" if op == "off" else "off"
+        buttons = [[Button.inline("✅ Да", f"bulkok:{op}"), Button.inline("« Отмена", f"list:{back}:0")]]
+        await self.reply(event, questions[op], buttons, edit=True)
+
+    async def run_bulk(self, event, op: str) -> None:
+        today = datetime.now(self.cfg.tz).date()
+        posts = self.store.all()
+        if op == "off":
+            targets = [p for p in posts if p["enabled"]]
+            for p in targets:
+                self.store.update(p["id"], enabled=False)
+            return await self.show_list(event, "off", edit=True, note=f"⏸ Выключено постов: {len(targets)}")
+        targets = [p for p in posts if not p["enabled"]]
+        if op == "on":
+            for p in targets:
+                self.store.update(p["id"], **self.enable_fields(p, today))
+            return await self.show_list(event, "on", edit=True, note=f"▶️ Включено постов: {len(targets)}")
+        if op == "del":
+            await self.delete_posts(targets)
+            return await self.show_list(event, "all", edit=True, note=f"🗑 Удалено постов: {len(targets)}")
+
+    def enable_fields(self, post: dict, today) -> dict:
+        """Поля для включения поста; закончившийся срок сбрасывается, иначе пост сразу выключится."""
+        fields = {"enabled": True}
+        if is_expired(post, today):
+            fields["until"] = None
+        return fields
+
+    async def delete_posts(self, posts: list[dict]) -> None:
+        """Полное удаление: посты, их файлы, отметки об отправке и исходные сообщения в чате с ботом."""
+        for post in posts:
+            self.store.delete(post["id"])
+        await self.sender.delete_source(posts, keep=self.store.all())
 
     async def card(self, post: dict, note: str | None = None):
         """Карточка поста: (текст, текст без разметки на случай ошибки, кнопки)."""
@@ -322,6 +386,7 @@ class ControlBot:
             f"💬 Чат: {await self.chat_label(post['chat'])}",
             f"⏰ Время: {', '.join(post['times']) or '⚠️ не задано'}",
             f"📅 Дни: {format_days(post['days'])}",
+            f"⏳ Срок: {format_until(post, now.date())}",
         ]
         if post["media"]:
             lines.append(f"📎 Вложения: {media_summary(post['media'])}")
@@ -348,10 +413,12 @@ class ControlBot:
              Button.inline("👁 Превью", f"test:{pid}")],
             [Button.inline("⏰ Время", f"edit:{pid}:times"),
              Button.inline("📅 Дни", f"edit:{pid}:days")],
-            [Button.inline("💬 Чат", f"edit:{pid}:chat"),
-             Button.inline("🔕 Без звука" if post["silent"] else "🔔 Со звуком", f"silent:{pid}")],
+            [Button.inline("⏳ Срок", f"edit:{pid}:until"),
+             Button.inline("💬 Чат", f"edit:{pid}:chat")],
+            [Button.inline("🔕 Без звука" if post["silent"] else "🔔 Со звуком", f"silent:{pid}")],
         ]
-        extra = [Button.inline("🔤 Подмена букв: " + ("вкл" if post["mix_letters"] else "выкл"), f"mix:{pid}")]
+        rows[-1].append(Button.inline("🔤 Подмена букв: " + ("вкл" if post["mix_letters"] else "выкл"), f"mix:{pid}"))
+        extra = []
         if not post["media"]:
             state = "вкл" if post["link_preview"] else "выкл"
             extra.append(Button.inline(f"🔗 Превью ссылок: {state}", f"lp:{pid}"))
@@ -359,7 +426,7 @@ class ControlBot:
             extra.append(Button.inline("🧹 Убрать вложения", f"nomedia:{pid}"))
         if extra:
             rows.append(extra)
-        rows.append([Button.inline("🗑 Удалить", f"del:{pid}"), Button.inline("« К списку", b"list:0")])
+        rows.append([Button.inline("🗑 Удалить", f"del:{pid}"), Button.inline("« К списку", b"list:all:0")])
         return header + body, header + safe_body, rows
 
     async def show_card(self, event, post_id: int, *, note: str | None = None, edit: bool = False) -> None:
@@ -457,6 +524,8 @@ class ControlBot:
             await self.handle_times(event, state, text)
         elif step.endswith("chat"):
             await self.handle_chat_text(event, state, text)
+        elif step.endswith("until"):
+            await self.handle_until_text(event, state, text)
 
     async def start_new(self, event, *, edit: bool = False) -> None:
         self.drop_state(event.sender_id)
@@ -577,15 +646,69 @@ class ControlBot:
     async def apply_chat(self, event, state: dict, chat, *, edit: bool = False) -> None:
         self.states.pop(event.sender_id, None)
         if state["step"] == "new_chat":
+            state["draft"]["chat"] = chat
+            state["step"] = "new_until"
+            self.states[event.sender_id] = state
+            return await self.ask_until(event, edit=edit)
+        self.store.update(state["post_id"], chat=chat)
+        await self.show_card(event, state["post_id"], note="✅ Чат обновлён", edit=edit)
+
+    async def ask_until(self, event, *, edit: bool = False, prefix: str = "") -> None:
+        codes = list(PERIODS)
+        rows = [[Button.inline(PERIODS[c][0], f"until:{c}") for c in codes[i:i + 3]] for i in range(0, len(codes), 3)]
+        rows.append([Button.inline("♾ Пока не выключу", b"until:inf")])
+        rows += cancel_buttons()
+        text = (prefix + "⏳ <b>Сколько публиковать пост?</b>\n\n"
+                "Выберите срок (считается с сегодняшнего дня) или пришлите дату последнего дня "
+                "публикаций, например <code>31.12.2026</code>.\n"
+                "Когда срок закончится, пост выключится сам, а бот пришлёт уведомление.")
+        await self.reply(event, text, rows, edit=edit)
+
+    async def choose_until(self, event, code: str) -> None:
+        state = self.states.get(event.sender_id)
+        if not state or not state["step"].endswith("until"):
+            await event.answer("Эта кнопка устарела", alert=True)
+            return
+        if code != "inf" and code not in PERIODS:
+            return
+        today = datetime.now(self.cfg.tz).date()
+        await self.apply_until(event, state, None if code == "inf" else period_end(today, code), edit=True)
+
+    async def handle_until_text(self, event, state: dict, text: str) -> None:
+        today = datetime.now(self.cfg.tz).date()
+        try:
+            until = parse_date(text, today)
+        except ValueError:
+            await event.respond("⚠️ Не понял дату. Формат — ДД.ММ.ГГГГ, например <code>31.12.2026</code>, "
+                                "или выберите срок кнопкой.", buttons=cancel_buttons())
+            return
+        if until < today:
+            await event.respond("⚠️ Эта дата уже прошла — пришлите будущую.", buttons=cancel_buttons())
+            return
+        await self.apply_until(event, state, until)
+
+    async def apply_until(self, event, state: dict, until, *, edit: bool = False) -> None:
+        self.states.pop(event.sender_id, None)
+        value = until.isoformat() if until else None
+        if state["step"] == "new_until":
             draft = state["draft"]
             post = self.store.add(text=draft["text"], media=draft["media"], times=draft["times"],
-                                  chat=chat, source=draft.get("source"))
+                                  chat=draft["chat"], source=draft.get("source"), until=value)
             note = "✅ Пост создан и включён. Дни недели и остальное можно настроить кнопками ниже."
             if post["source"]:
                 note += "\n📨 Не удаляйте исходное сообщение из этого чата: пост копируется из него."
             return await self.show_card(event, post["id"], note=note, edit=edit)
-        self.store.update(state["post_id"], chat=chat)
-        await self.show_card(event, state["post_id"], note="✅ Чат обновлён", edit=edit)
+        post = self.store.get(state["post_id"])
+        if post is None:
+            return await self.show_list(event, edit=edit, note="⚠️ Пост не найден — возможно, его удалили.")
+        today = datetime.now(self.cfg.tz).date()
+        fields = {"until": value}
+        note = "✅ Срок обновлён"
+        if not post["enabled"] and is_expired(post, today):  # продлили закончившийся пост
+            fields["enabled"] = True
+            note = "✅ Срок продлён, пост снова включён"
+        self.store.update(post["id"], **fields)
+        await self.show_card(event, post["id"], note=note, edit=edit)
 
     # ── кнопки ────────────────────────────────────────────────────
 
@@ -610,6 +733,8 @@ class ControlBot:
             return await self.pick_chat(event)
         if action == "chat":
             return await self.choose_chat(event, arg)
+        if action == "until":
+            return await self.choose_until(event, arg)
 
         # Любая другая кнопка — уход из пошагового диалога
         self.drop_state(user_id)
@@ -620,7 +745,12 @@ class ControlBot:
         if action == "status":
             return await self.show_status(event, edit=True)
         if action == "list":
-            return await self.show_list(event, int(arg) if arg.isdigit() else 0, edit=True)
+            view, _, page = arg.partition(":")
+            return await self.show_list(event, view, int(page) if page.isdigit() else 0, edit=True)
+        if action == "bulk" and arg in ("on", "off", "del"):
+            return await self.show_bulk_confirm(event, arg)
+        if action == "bulkok" and arg in ("on", "off", "del"):
+            return await self.run_bulk(event, arg)
         if action == "new":
             return await self.start_new(event, edit=True)
 
@@ -635,8 +765,15 @@ class ControlBot:
         if action == "post":
             await self.show_card(event, pid, edit=True)
         elif action == "toggle":
-            post = self.store.update(pid, enabled=not post["enabled"])
-            await event.answer("Пост включён" if post["enabled"] else "Пост выключен")
+            today = datetime.now(self.cfg.tz).date()
+            if post["enabled"]:
+                self.store.update(pid, enabled=False)
+                await event.answer("Пост выключен")
+            else:
+                expired = is_expired(post, today)
+                self.store.update(pid, **self.enable_fields(post, today))
+                await event.answer("Срок закончился — пост включён без срока. Задать новый: «⏳ Срок»"
+                                   if expired else "Пост включён", alert=expired)
             await self.show_card(event, pid, edit=True)
         elif action == "silent":
             self.store.update(pid, silent=not post["silent"])
@@ -692,10 +829,12 @@ class ControlBot:
             await self.show_card(event, pid, note="🧹 Вложения удалены", edit=True)
         elif action == "del":
             buttons = [[Button.inline("✅ Да, удалить", f"delok:{pid}"), Button.inline("« Отмена", f"post:{pid}")]]
-            await self.reply(event, f"🗑 Удалить пост #{pid}? Это действие нельзя отменить.", buttons, edit=True)
+            await self.reply(event, f"🗑 Удалить пост #{pid} полностью?\n"
+                             "Удалятся сам пост, его файлы, история отправок и исходное сообщение "
+                             "в этом чате. Отменить будет нельзя.", buttons, edit=True)
         elif action == "delok":
-            self.store.delete(pid)
-            await self.show_list(event, edit=True, note=f"🗑 Пост #{pid} удалён")
+            await self.delete_posts([post])
+            await self.show_list(event, edit=True, note=f"🗑 Пост #{pid} удалён полностью")
 
     async def start_edit(self, event, post: dict, field: str) -> None:
         user_id, pid = event.sender_id, post["id"]
@@ -712,6 +851,10 @@ class ControlBot:
             await self.ask_chat(event, edit=True)
         elif field == "days":
             await self.show_days(event, post)
+        elif field == "until":
+            self.states[user_id] = {"step": "edit_until", "post_id": pid}
+            current = format_until(post, datetime.now(self.cfg.tz).date())
+            await self.ask_until(event, edit=True, prefix=f"Сейчас: <b>{current}</b>\n\n")
 
     async def preview(self, event, post: dict) -> None:
         await event.answer("Готовлю превью…")
