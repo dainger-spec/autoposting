@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 import time
 
@@ -30,6 +32,18 @@ class SendError(Exception):
     pass
 
 
+class ChannelPostMissing(Exception):
+    """Сообщение поста в канале удалили — нужно опубликовать заново."""
+
+
+def content_key(post: dict) -> str:
+    """Отпечаток содержимого: изменился — значит, в канале лежит устаревшая версия."""
+    src = post.get("source") or {}
+    data = [post["text"], [m["file"] for m in post["media"]], src.get("text_id"), src.get("media_ids"),
+            post["mix_letters"]]
+    return hashlib.sha1(json.dumps(data, ensure_ascii=False).encode()).hexdigest()[:12]
+
+
 def describe_error(exc: BaseException) -> str:
     """Понятное описание частых ошибок Telegram."""
     if isinstance(exc, SendError):
@@ -48,6 +62,8 @@ def describe_error(exc: BaseException) -> str:
         return "чат недоступен: вы не участник или вас удалили"
     if isinstance(exc, errors.MediaCaptionTooLongError):
         return "подпись к медиа слишком длинная (без Premium лимит — 1024 символа)"
+    if isinstance(exc, errors.ChatForwardsRestrictedError):
+        return "в канале запрещена пересылка (включено «Запретить копирование»)"
     if isinstance(exc, errors.MessageTooLongError):
         return "текст слишком длинный (лимит — 4096 символов)"
     if isinstance(exc, ValueError):
@@ -123,9 +139,11 @@ async def send_post(client: TelegramClient, entity, post: dict, source: dict | N
 
 
 class Sender:
-    def __init__(self, client: TelegramClient, default_chat: str | int | None):
+    def __init__(self, client: TelegramClient, default_chat: str | int | None, store=None, settings=None):
         self.client = client
         self.default_chat = default_chat
+        self.store = store
+        self.settings = settings
         self._titles: dict = {}
         self._dialogs_loaded = False
         self.me_id: int | None = None
@@ -221,6 +239,64 @@ class Sender:
             await self.client.get_dialogs()
             return await self.client.get_input_entity(chat)
 
+    @property
+    def channel(self):
+        return self.settings.channel if self.settings else None
+
+    def uses_channel(self, post: dict) -> bool:
+        return self.channel is not None and post["via_channel"]
+
+    def channel_post_ready(self, post: dict) -> bool:
+        info = post.get("channel_post")
+        return bool(info) and info["chat"] == self.channel and info["key"] == content_key(post)
+
+    async def publish(self, post: dict):
+        """Публикация по расписанию: напрямую в чат или пересылкой из канала."""
+        if not self.uses_channel(post):
+            return await self.send(post)
+        chat = self.target(post)
+        if chat is None:
+            raise SendError("не указан чат: выберите его в посте или задайте DEFAULT_CHAT в .env")
+        target = await self._input_entity(chat)
+        info = await self.ensure_channel_post(post)
+        try:
+            return await self._forward(target, info, post)
+        except (ChannelPostMissing, errors.MessageIdInvalidError):
+            log.info("Пост #%s: сообщения в канале больше нет — публикую заново", post["id"])
+            info = await self.ensure_channel_post(post, force=True)
+            return await self._forward(target, info, post)
+
+    async def ensure_channel_post(self, post: dict, *, force: bool = False) -> dict:
+        """Публикует пост в канал один раз; дальше он только пересылается оттуда."""
+        if not force and self.channel_post_ready(post):
+            return post["channel_post"]
+        channel = self.channel
+        entity = await self._input_entity(channel)
+        result = await send_post(self.client, entity, post, await self.load_source(post))
+        messages = result if isinstance(result, list) else [result]
+        info = {"chat": channel, "ids": [m.id for m in messages], "key": content_key(post)}
+        if self.store is not None:
+            self.store.update(post["id"], channel_post=info)
+        post["channel_post"] = info
+        log.info("Пост #%s опубликован в канале %s", post["id"], channel)
+        return info
+
+    async def _forward(self, target, info: dict, post: dict):
+        channel = await self._input_entity(info["chat"])
+        try:
+            result = await self.client.forward_messages(target, info["ids"], from_peer=channel,
+                                                        silent=post["silent"])
+        except errors.FloodWaitError as exc:
+            if exc.seconds > 120:
+                raise
+            await asyncio.sleep(exc.seconds + 1)
+            result = await self.client.forward_messages(target, info["ids"], from_peer=channel,
+                                                        silent=post["silent"])
+        messages = result if isinstance(result, list) else [result]
+        if not messages or any(m is None for m in messages):
+            raise ChannelPostMissing()
+        return messages
+
     async def send(self, post: dict):
         chat = self.target(post)
         if chat is None:
@@ -269,7 +345,7 @@ class Sender:
             self._titles[chat] = (None, time.monotonic())
         return title
 
-    async def writable_dialogs(self, limit: int = 40) -> list[tuple[int, str]]:
+    async def writable_dialogs(self, limit: int = 40, *, channels_only: bool = False) -> list[tuple[int, str]]:
         """Группы и каналы, куда аккаунт может публиковать."""
         result = []
         async for dialog in self.client.iter_dialogs(limit=300):
@@ -278,7 +354,7 @@ class Sender:
                 rights = getattr(entity, "admin_rights", None)
                 if not (getattr(entity, "creator", False) or (rights and rights.post_messages)):
                     continue
-            elif not dialog.is_group:
+            elif not dialog.is_group or channels_only:
                 continue
             title = dialog.name or "Без названия"
             self._titles[dialog.id] = (title, None)

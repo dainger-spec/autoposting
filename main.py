@@ -19,6 +19,7 @@ from autoposter.botlogin import BotLogin
 from autoposter.config import Config, ConfigError, load_config
 from autoposter.scheduler import Scheduler
 from autoposter.sender import Sender
+from autoposter.settings import Settings
 from autoposter.storage import PostStore
 
 log = logging.getLogger("autoposter")
@@ -57,7 +58,8 @@ async def run(cfg: Config) -> None:
         save_owner(owner_file, owner_id)
 
     try:
-        sender = Sender(user, cfg.default_chat)
+        settings = Settings(cfg.settings_file, cfg.channel)
+        sender = Sender(user, cfg.default_chat, store, settings)
         await sender.attach_bot(me, bot_me)
         admins = {me.id, *cfg.admin_ids} | ({owner_id} if owner_id else set())
         control = ControlBot(bot, cfg, store, sender, admins=admins)

@@ -63,7 +63,7 @@ class Scheduler:
         key = (post["id"], day, hhmm)
         chat_title = await self.sender.title(self.sender.target(post)) or str(self.sender.target(post))
         try:
-            await self.sender.send(post)
+            await self.sender.publish(post)
         except RETRYABLE as exc:
             self._attempts[key] = self._attempts.get(key, 0) + 1
             if self._attempts[key] < MAX_ATTEMPTS:

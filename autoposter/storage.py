@@ -85,7 +85,17 @@ def normalize_post(raw: dict, post_id: int) -> dict:
         "mix_letters": bool(raw.get("mix_letters", True)),
         "until": _normalize_until(raw.get("until"), post_id),
         "source": _normalize_source(raw.get("source")),
+        "via_channel": bool(raw.get("via_channel", True)),
+        "channel_post": _normalize_channel_post(raw.get("channel_post")),
     }
+
+
+def _normalize_channel_post(raw) -> dict | None:
+    """Сообщение поста в канале, откуда его пересылают: {"chat", "ids", "key"}."""
+    if not isinstance(raw, dict) or not isinstance(raw.get("chat"), (int, str)):
+        return None
+    ids = [i for i in raw.get("ids") or [] if _int_or_none(i) is not None]
+    return {"chat": raw["chat"], "ids": ids, "key": str(raw.get("key") or "")} if ids else None
 
 
 def _normalize_until(raw, post_id: int) -> str | None:

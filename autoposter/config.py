@@ -30,6 +30,11 @@ class Config:
     notify_success: bool
     posts_file: Path
     data_dir: Path
+    channel: str | int | None = None
+
+    @property
+    def settings_file(self) -> Path:
+        return self.data_dir / "settings.json"
 
     @property
     def state_file(self) -> Path:
@@ -137,4 +142,5 @@ def load_config() -> Config:
         notify_success=_bool("NOTIFY_ON_SUCCESS", True),
         posts_file=posts_file,
         data_dir=data_dir,
+        channel=parse_chat(os.getenv("CHANNEL", "")),
     )

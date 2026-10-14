@@ -243,9 +243,66 @@ class ControlBot:
         )
         buttons = [
             [Button.inline("📋 Мои посты", b"list:all:0"), Button.inline("➕ Новый пост", b"new")],
-            [Button.inline("ℹ️ Статус", b"status"), Button.inline("❓ Помощь", b"help")],
+            [Button.inline("ℹ️ Статус", b"status"), Button.inline("⚙️ Настройки", b"settings")],
+            [Button.inline("❓ Помощь", b"help")],
         ]
         await self.reply(event, text, buttons, edit=edit)
+
+    async def show_settings(self, event, *, edit: bool = False, note: str | None = None) -> None:
+        channel = self.sender.channel
+        label = await self.chat_title_html(channel) if channel is not None else "не задан"
+        text = (f"{note}\n\n" if note else "") + (
+            "<b>⚙️ Настройки</b>\n\n"
+            f"📢 Канал для постов: <b>{label}</b>\n\n"
+            "Если канал задан, каждый пост сначала <b>один раз</b> публикуется в этот канал, "
+            "а затем по расписанию <b>пересылается</b> оттуда в чат (с пометкой «Переслано из …»). "
+            "Новых постов в канале при этом не появляется.\n"
+            "Если пост изменить, в канал уйдёт его новая версия.\n\n"
+            "Без канала посты отправляются в чат напрямую."
+        )
+        rows = [[Button.inline("📢 Выбрать канал", b"setchan")]]
+        if channel is not None:
+            rows[0].append(Button.inline("✖️ Без канала", b"nochan"))
+        rows.append([Button.inline("« Меню", b"menu")])
+        await self.reply(event, text, rows, edit=edit)
+
+    async def ask_channel(self, event) -> None:
+        self.states[event.sender_id] = {"step": "set_channel"}
+        await event.answer("Загружаю ваши каналы…")
+        channels = await self.sender.writable_dialogs(channels_only=True)
+        rows = [[Button.inline(short(title, 50), f"chan:{peer_id}")] for peer_id, title in channels]
+        rows += cancel_buttons()
+        text = ("📢 <b>Выберите канал</b>, в который будут публиковаться посты перед пересылкой.\n"
+                "Нужного нет? Пришлите его @username, ссылку или ID сообщением.\n\n"
+                "Ваш аккаунт должен иметь право публиковать в этом канале.")
+        await self.reply(event, text, rows, edit=True)
+
+    async def set_channel(self, event, channel, *, edit: bool = False) -> None:
+        self.states.pop(event.sender_id, None)
+        self.sender.settings.channel = channel
+        note = (f"✅ Канал выбран: {await self.chat_title_html(channel)}" if channel is not None
+                else "✅ Канал отключён — посты будут отправляться в чат напрямую")
+        await self.show_settings(event, edit=edit, note=note)
+
+    async def handle_channel_text(self, event, text: str) -> None:
+        try:
+            channel, _ = await self.sender.lookup(text)
+        except Exception as exc:
+            await event.respond(f"❌ Не получилось найти канал: {html.escape(describe_error(exc))}",
+                                buttons=cancel_buttons())
+            return
+        await self.set_channel(event, channel)
+
+    async def publish_to_channel(self, post: dict) -> str:
+        """Сразу публикует новый или изменённый пост в канал. Возвращает строку для заметки."""
+        if not self.sender.uses_channel(post) or self.sender.channel_post_ready(post):
+            return ""
+        try:
+            await self.sender.ensure_channel_post(post)
+        except Exception as exc:
+            return (f"\n⚠️ Не удалось опубликовать в канал: {html.escape(describe_error(exc))}. "
+                    "Попробую ещё раз при первой отправке.")
+        return f"\n📢 Опубликован в канале {await self.chat_title_html(self.sender.channel)}"
 
     async def show_help(self, event, *, edit: bool = False) -> None:
         await self.reply(event, HELP.format(tz=self.cfg.tz.key), [[Button.inline("« Меню", b"menu")]], edit=edit)
@@ -268,6 +325,8 @@ class ControlBot:
             f"👤 Аккаунт: {name}{username}",
             f"🕒 Сейчас: {now:%H:%M} ({self.cfg.tz.key})",
             f"💬 Чат по умолчанию: {default}",
+            "📢 Канал для пересылки: " + (await self.chat_title_html(self.sender.channel)
+                                          if self.sender.channel is not None else "не задан"),
             f"📋 Постов: {len(posts)}, активных: {len(active)}",
             "",
             "<b>⏭ Ближайшие публикации:</b>",
@@ -390,7 +449,11 @@ class ControlBot:
         ]
         if post["media"]:
             lines.append(f"📎 Вложения: {media_summary(post['media'])}")
-        if post["source"] and post["source"]["peer"] == self.sender.bot_id:
+        if self.sender.uses_channel(post):
+            state = ("сообщение в канале уже есть" if self.sender.channel_post_ready(post)
+                     else "в канал опубликуется при первой отправке")
+            lines.append(f"📢 Пересылается из канала {await self.chat_title_html(self.sender.channel)} ({state})")
+        elif post["source"] and post["source"]["peer"] == self.sender.bot_id:
             lines.append("📨 Отправляется копией вашего сообщения")
         when = next_run(post, now)
         if when:
@@ -419,6 +482,9 @@ class ControlBot:
         ]
         rows[-1].append(Button.inline("🔤 Подмена букв: " + ("вкл" if post["mix_letters"] else "выкл"), f"mix:{pid}"))
         extra = []
+        if self.sender.channel is not None:
+            extra.append(Button.inline("📢 Через канал: " + ("вкл" if post["via_channel"] else "выкл"),
+                                       f"via:{pid}"))
         if not post["media"]:
             state = "вкл" if post["link_preview"] else "выкл"
             extra.append(Button.inline(f"🔗 Превью ссылок: {state}", f"lp:{pid}"))
@@ -526,6 +592,8 @@ class ControlBot:
             await self.handle_chat_text(event, state, text)
         elif step.endswith("until"):
             await self.handle_until_text(event, state, text)
+        elif step == "set_channel":
+            await self.handle_channel_text(event, text)
 
     async def start_new(self, event, *, edit: bool = False) -> None:
         self.drop_state(event.sender_id)
@@ -536,6 +604,8 @@ class ControlBot:
         state = self.states.get(event.sender_id)
         post_id = state.get("post_id") if state else None
         self.drop_state(event.sender_id)
+        if state and state["step"] == "set_channel":
+            return await self.show_settings(event, edit=edit)
         if post_id:
             await self.show_card(event, post_id, edit=edit)
         else:
@@ -611,7 +681,8 @@ class ControlBot:
             return await self.show_list(event, note="⚠️ Пост не найден — возможно, его удалили.")
         if media:
             self.store.release_media(old["media"])
-        await self.show_card(event, post_id, note="✅ Содержимое обновлено")
+        note = "✅ Содержимое обновлено" + await self.publish_to_channel(self.store.get(post_id))
+        await self.show_card(event, post_id, note=note)
 
     async def handle_times(self, event, state: dict, text: str) -> None:
         try:
@@ -697,6 +768,7 @@ class ControlBot:
             note = "✅ Пост создан и включён. Дни недели и остальное можно настроить кнопками ниже."
             if post["source"]:
                 note += "\n📨 Не удаляйте исходное сообщение из этого чата: пост копируется из него."
+            note += await self.publish_to_channel(post)
             return await self.show_card(event, post["id"], note=note, edit=edit)
         post = self.store.get(state["post_id"])
         if post is None:
@@ -735,6 +807,15 @@ class ControlBot:
             return await self.choose_chat(event, arg)
         if action == "until":
             return await self.choose_until(event, arg)
+        if action == "chan":
+            state = self.states.get(user_id)
+            if not state or state["step"] != "set_channel":
+                await event.answer("Эта кнопка устарела", alert=True)
+                return
+            try:
+                return await self.set_channel(event, int(arg), edit=True)
+            except ValueError:
+                return
 
         # Любая другая кнопка — уход из пошагового диалога
         self.drop_state(user_id)
@@ -742,6 +823,12 @@ class ControlBot:
             return await self.show_menu(event, edit=True)
         if action == "help":
             return await self.show_help(event, edit=True)
+        if action == "settings":
+            return await self.show_settings(event, edit=True)
+        if action == "setchan":
+            return await self.ask_channel(event)
+        if action == "nochan":
+            return await self.set_channel(event, None, edit=True)
         if action == "status":
             return await self.show_status(event, edit=True)
         if action == "list":
@@ -781,7 +868,12 @@ class ControlBot:
         elif action == "mix":
             post = self.store.update(pid, mix_letters=not post["mix_letters"])
             await event.answer("Подмена букв " + ("включена" if post["mix_letters"] else "выключена"))
-            await self.show_card(event, pid, edit=True)
+            note = await self.publish_to_channel(post)  # в канал уходит новая версия текста
+            await self.show_card(event, pid, edit=True, note=note.strip() or None)
+        elif action == "via":
+            post = self.store.update(pid, via_channel=not post["via_channel"])
+            note = await self.publish_to_channel(post) if post["via_channel"] else ""
+            await self.show_card(event, pid, edit=True, note=note.strip() or None)
         elif action == "lp":
             self.store.update(pid, link_preview=not post["link_preview"])
             await self.show_card(event, pid, edit=True)
@@ -791,11 +883,12 @@ class ControlBot:
                 return
             label = await self.chat_label(post["chat"])
             buttons = [[Button.inline("✅ Да, отправить", f"sendok:{pid}"), Button.inline("« Назад", f"post:{pid}")]]
-            await self.reply(event, f"🚀 Опубликовать пост #{pid} в {label} прямо сейчас?", buttons, edit=True)
+            how = " (пересылкой из канала)" if self.sender.uses_channel(post) else ""
+            await self.reply(event, f"🚀 Опубликовать пост #{pid} в {label}{how} прямо сейчас?", buttons, edit=True)
         elif action == "sendok":
             await event.answer("Отправляю…")
             try:
-                await self.sender.send(post)
+                await self.sender.publish(post)
             except Exception as exc:
                 note = f"❌ Не удалось отправить: {html.escape(describe_error(exc))}"
             else:
@@ -831,7 +924,9 @@ class ControlBot:
             buttons = [[Button.inline("✅ Да, удалить", f"delok:{pid}"), Button.inline("« Отмена", f"post:{pid}")]]
             await self.reply(event, f"🗑 Удалить пост #{pid} полностью?\n"
                              "Удалятся сам пост, его файлы, история отправок и исходное сообщение "
-                             "в этом чате. Отменить будет нельзя.", buttons, edit=True)
+                             "в этом чате. Отменить будет нельзя.\n"
+                             "Сообщение в канале (если было) останется — его можно удалить в самом канале.",
+                             buttons, edit=True)
         elif action == "delok":
             await self.delete_posts([post])
             await self.show_list(event, edit=True, note=f"🗑 Пост #{pid} удалён полностью")
