@@ -1,0 +1,11 @@
+# Секреты и личные данные — не публиковать!
+.env
+posts.json
+data/
+*.session
+*.session-journal
+
+__pycache__/
+*.pyc
+.venv/
+venv/
