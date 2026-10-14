@@ -1,5 +1,6 @@
 # Секреты и личные данные — не публиковать!
 .env
+config.env
 posts.json
 data/
 *.session

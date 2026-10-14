@@ -90,6 +90,8 @@ def _bool(name: str, default: bool) -> bool:
 
 def load_config() -> Config:
     load_dotenv(BASE_DIR / ".env")
+    # то же самое, но без точки в имени: такие файлы не теряются при загрузке на хостинг
+    load_dotenv(BASE_DIR / "config.env")
 
     # TELEGRAM_API_ID / TELEGRAM_API_HASH — так эти параметры называет, например, bothost.ru
     api_id = _required("API_ID", "TELEGRAM_API_ID")

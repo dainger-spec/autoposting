@@ -2,7 +2,7 @@
 
 Запуск:  python main.py
 При первом запуске попросит номер телефона и код из Telegram (один раз).
-Для хостинга без консоли сначала выполните python login.py (см. README).
+На хостинге без консоли вход в аккаунт проходит прямо в чате с ботом.
 """
 from __future__ import annotations
 
@@ -13,8 +13,9 @@ import sys
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 
-from autoposter.auth import login_user
+from autoposter.auth import has_console, load_owner, login_user, save_owner
 from autoposter.bot import ControlBot
+from autoposter.botlogin import BotLogin
 from autoposter.config import Config, ConfigError, load_config
 from autoposter.scheduler import Scheduler
 from autoposter.sender import Sender
@@ -40,13 +41,25 @@ async def run(cfg: Config) -> None:
     bot_id = cfg.bot_token.split(":", 1)[0]
     bot = TelegramClient(str(cfg.data_dir / f"bot_{bot_id}"), cfg.api_id, cfg.api_hash)
 
-    me = await login_user(user, cfg.phone, from_string=bool(cfg.session_string))
     await bot.start(bot_token=cfg.bot_token)
+    bot.parse_mode = "html"
     bot_me = await bot.get_me()
+
+    owner_file = cfg.data_dir / "owner.json"
+    owner_id = load_owner(owner_file)
+    await user.connect()
+    if cfg.session_string or has_console() or await user.is_user_authorized():
+        me = await login_user(user, cfg.phone, from_string=bool(cfg.session_string))
+    else:
+        # Консоли нет (хостинг) — входим в аккаунт прямо в чате с ботом
+        log.info("Нужно войти в аккаунт: откройте @%s в Telegram и отправьте /start", bot_me.username)
+        me, owner_id = await BotLogin(bot, user, cfg.admin_ids).run()
+        save_owner(owner_file, owner_id)
 
     try:
         sender = Sender(user, cfg.default_chat)
-        control = ControlBot(bot, cfg, store, sender, admins={me.id, *cfg.admin_ids})
+        admins = {me.id, *cfg.admin_ids} | ({owner_id} if owner_id else set())
+        control = ControlBot(bot, cfg, store, sender, admins=admins)
         await control.setup()
         scheduler = Scheduler(store, sender, control.notify, cfg)
 
