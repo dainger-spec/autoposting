@@ -312,19 +312,22 @@ class Sender:
 
     async def _forward(self, target, info: dict, post: dict):
         channel = await self._input_entity(info["chat"])
+        # Есть ли ещё сообщение в канале, проверяем отдельным запросом. По ответу на пересылку
+        # этого не понять: Telethon иногда не может сопоставить ответ (например, при пересылке
+        # в «Избранное» или при сбоях на стороне Telegram) и возвращает None, хотя пересылка
+        # прошла. Раньше это принималось за удалённый пост, и в канале появлялась копия.
+        existing = await self.client.get_messages(channel, ids=info["ids"])
+        if any(m is None for m in existing):
+            raise ChannelPostMissing()
         try:
-            result = await self.client.forward_messages(target, info["ids"], from_peer=channel,
-                                                        silent=post["silent"])
+            return await self.client.forward_messages(target, info["ids"], from_peer=channel,
+                                                      silent=post["silent"])
         except errors.FloodWaitError as exc:
             if exc.seconds > 120:
                 raise
             await asyncio.sleep(exc.seconds + 1)
-            result = await self.client.forward_messages(target, info["ids"], from_peer=channel,
-                                                        silent=post["silent"])
-        messages = result if isinstance(result, list) else [result]
-        if not messages or any(m is None for m in messages):
-            raise ChannelPostMissing()
-        return messages
+            return await self.client.forward_messages(target, info["ids"], from_peer=channel,
+                                                      silent=post["silent"])
 
     async def send(self, post: dict):
         chat = self.target(post)
