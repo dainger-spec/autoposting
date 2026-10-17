@@ -5,7 +5,9 @@ import asyncio
 import hashlib
 import json
 import logging
+import random
 import time
+from datetime import datetime, timedelta, timezone
 
 from telethon import Button, TelegramClient, errors, types, utils
 from telethon.extensions import html as tl_html
@@ -18,6 +20,10 @@ log = logging.getLogger(__name__)
 
 # Временные сбои: отправку имеет смысл повторить
 RETRYABLE = (ConnectionError, asyncio.TimeoutError, errors.ServerError, errors.TimedOutError)
+# Сессия больше не работает (вышли из аккаунта, сессию завершили, аккаунт заблокирован):
+# продолжать бессмысленно, скрипт перезапустится и попросит войти заново
+FATAL = (errors.AuthKeyUnregisteredError, errors.SessionRevokedError, errors.AuthKeyDuplicatedError,
+         errors.UserDeactivatedError, errors.UserDeactivatedBanError)
 
 _KIND_OPTIONS = {
     "video": {"supports_streaming": True},
@@ -48,6 +54,16 @@ def describe_error(exc: BaseException) -> str:
     """Понятное описание частых ошибок Telegram."""
     if isinstance(exc, SendError):
         return str(exc)
+    if isinstance(exc, errors.PeerFloodError):
+        return ("Telegram временно ограничил аккаунт за спам (PEER_FLOOD) — проверьте статус в @SpamBot")
+    if isinstance(exc, (errors.UserDeactivatedBanError, errors.UserDeactivatedError)):
+        return "аккаунт заблокирован или удалён Telegram"
+    if isinstance(exc, (errors.AuthKeyUnregisteredError, errors.SessionRevokedError, errors.AuthKeyDuplicatedError)):
+        return "сессия аккаунта больше не действует — нужно войти заново"
+    if isinstance(exc, (errors.ChatRestrictedError, errors.UserRestrictedError)):
+        return "в этом чате вам ограничили отправку сообщений"
+    if isinstance(exc, (errors.ChatSendMediaForbiddenError, errors.ChatSendPlainForbiddenError)):
+        return "в этом чате запрещено отправлять такие сообщения (медиа или текст)"
     if isinstance(exc, errors.FloodWaitError):
         return f"лимит Telegram, нужно подождать {exc.seconds} с"
     if isinstance(exc, errors.SlowModeWaitError):
@@ -151,8 +167,13 @@ async def send_post(client: TelegramClient, entity, post: dict, source: dict | N
 
 
 class Sender:
-    def __init__(self, client: TelegramClient, default_chat: str | int | None, store=None, settings=None):
+    def __init__(self, client: TelegramClient, default_chat: str | int | None, store=None, settings=None,
+                 pause_between: tuple[float, float] = (0.0, 0.0)):
         self.client = client
+        # случайная пауза между отправками в разные чаты, чтобы не слать пачкой
+        self.pause_between = pause_between
+        self._last_send = 0.0
+        self.tz = None  # часовой пояс для сообщений (задаётся из настроек)
         self.default_chat = default_chat
         self.store = store
         self.settings = settings
@@ -163,6 +184,7 @@ class Sender:
         self.bot_client: TelegramClient | None = None
         self.bot_username: str | None = None
         self._bot_peer = None
+        self._channel_locks: dict[int, asyncio.Lock] = {}
 
     async def attach_bot(self, me, bot_me, bot_client: TelegramClient | None = None) -> None:
         """Запоминает бота управления: посты копируются из ваших сообщений в чате с ним,
@@ -279,13 +301,44 @@ class Sender:
             try:
                 await self.publish_to(post, chat)
                 results.append((chat, None))
+            except FATAL:
+                raise
             except Exception as exc:
                 log.warning("Пост #%s → %s: %s", post["id"], chat, describe_error(exc))
                 results.append((chat, exc))
+                if isinstance(exc, (errors.PeerFloodError, errors.FloodWaitError)):
+                    break  # аккаунт ограничен — в остальные чаты не пробуем
         return results
+
+    def paused_note(self) -> str | None:
+        """Текст ошибки, если рассылка на паузе."""
+        if self.settings is None or not self.settings.is_paused(datetime.now(timezone.utc)):
+            return None
+        until = self.settings.paused_until.astimezone(self.tz)
+        return f"рассылка на паузе до {until:%d.%m %H:%M} — снять паузу можно в «⚙️ Настройках»"
+
+    async def _pace(self) -> None:
+        low, high = self.pause_between
+        wait = self._last_send + random.uniform(low, high) - time.monotonic()
+        if wait > 0:
+            await asyncio.sleep(wait)
+        self._last_send = time.monotonic()
 
     async def publish_to(self, post: dict, chat):
         """Публикация в один чат: напрямую или пересылкой одного и того же сообщения из канала."""
+        note = self.paused_note()
+        if note:
+            raise SendError(note)
+        await self._pace()
+        try:
+            return await self._publish_to(post, chat)
+        except errors.PeerFloodError:
+            if self.settings is not None:  # пауза, даже если отправляли вручную
+                self.settings.pause(datetime.now(timezone.utc) + timedelta(hours=24),
+                                    "Telegram ограничил аккаунт за спам (PEER_FLOOD)")
+            raise
+
+    async def _publish_to(self, post: dict, chat):
         if not self.uses_channel(post):
             return await self.send(post, chat)
         target = await self._input_entity(chat)
@@ -294,13 +347,27 @@ class Sender:
             return await self._forward(target, info, post)
         except (ChannelPostMissing, errors.MessageIdInvalidError):
             log.info("Пост #%s: сообщения в канале больше нет — публикую заново", post["id"])
-            info = await self.ensure_channel_post(post, force=True)
+            info = await self.ensure_channel_post(post, stale_ids=info["ids"])
             return await self._forward(target, info, post)
 
-    async def ensure_channel_post(self, post: dict, *, force: bool = False) -> dict:
-        """Публикует пост в канал один раз; дальше он только пересылается оттуда."""
-        if not force and self.channel_post_ready(post):
-            return post["channel_post"]
+    async def ensure_channel_post(self, post: dict, *, stale_ids: list[int] | None = None) -> dict:
+        """Публикует пост в канал один раз; дальше он только пересылается оттуда.
+
+        stale_ids — сообщения в канале, которых больше нет: тогда пост публикуется заново.
+        """
+        lock = self._channel_locks.setdefault(post["id"], asyncio.Lock())
+        async with lock:
+            # Пока ждали, пост мог опубликовать другой вызов (расписание и «Отправить сейчас»
+            # одновременно) — берём свежую версию из хранилища, чтобы не сделать дубль в канале.
+            fresh = self.store.get(post["id"]) if self.store is not None else None
+            if fresh is not None:
+                post["channel_post"] = fresh["channel_post"]
+            info = post.get("channel_post")
+            if self.channel_post_ready(post) and (stale_ids is None or info["ids"] != stale_ids):
+                return info
+            return await self._publish_to_channel(post)
+
+    async def _publish_to_channel(self, post: dict) -> dict:
         channel = self.channel
         source = await self.load_source(post)
         if post["buttons"] and self.bot_client is not None:
@@ -389,6 +456,16 @@ class Sender:
             self._titles[chat] = (None, time.monotonic())
         return title
 
+    @staticmethod
+    def _can_write(entity) -> bool:
+        """Можно ли писать в группу: админ — да, иначе смотрим общие запреты и личный бан."""
+        if getattr(entity, "creator", False) or getattr(entity, "admin_rights", None):
+            return True
+        for rights in (getattr(entity, "banned_rights", None), getattr(entity, "default_banned_rights", None)):
+            if rights is not None and rights.send_messages:
+                return False
+        return True
+
     async def writable_dialogs(self, limit: int = 40, *, channels_only: bool = False) -> list[tuple[int, str]]:
         """Группы и каналы, куда аккаунт может публиковать."""
         result = []
@@ -399,6 +476,8 @@ class Sender:
                 if not (getattr(entity, "creator", False) or (rights and rights.post_messages)):
                     continue
             elif not dialog.is_group or channels_only:
+                continue
+            elif not self._can_write(entity):
                 continue
             title = dialog.name or "Без названия"
             self._titles[dialog.id] = (title, None)

@@ -10,7 +10,7 @@ import shutil
 import time
 import uuid
 from collections import Counter
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from telethon import Button, TelegramClient, errors, events, functions, types, utils
@@ -27,7 +27,7 @@ log = logging.getLogger(__name__)
 PAGE_SIZE = 8
 CHAT_PAGE_SIZE = 15
 LIST_VIEWS = {"all": "Все", "on": "🟢 Вкл", "off": "⏸ Выкл"}
-BODY_PREVIEW_LIMIT = 3000
+BODY_PREVIEW_LIMIT = 2500
 
 KIND_NAMES = {
     "photo": "фото", "video": "видео", "animation": "GIF", "document": "файл", "auto": "файл",
@@ -197,6 +197,8 @@ class ControlBot:
         self.states: dict[int, dict] = {}
         self._dialogs: list | None = None
         self._dialogs_at = 0.0
+        self._sending: set[int] = set()
+        self._picker_options: dict[tuple, list] = {}
 
     async def setup(self) -> None:
         self.bot.parse_mode = "html"
@@ -286,7 +288,8 @@ class ControlBot:
                 await event.answer("Эта кнопка устарела", alert=True)
             return await self.show_list(event, edit=edit)
 
-        dialogs = await self.cached_dialogs()
+        source_channel = self.sender.channel
+        dialogs = [d for d in await self.cached_dialogs() if d[0] != source_channel]
         known = {peer for peer, _ in dialogs}
         # отмеченные вручную (по ссылке, @username) и «Избранное» тоже показываем в списке
         extra = [(c, await self.sender.title(c) or str(c)) for c in selected if c not in known and c != "me"]
@@ -294,9 +297,14 @@ class ControlBot:
 
         pages = max(1, math.ceil(len(options) / CHAT_PAGE_SIZE))
         page = min(max(page, 0), pages - 1)
-        rows = [[Button.inline(short(("✅ " if value in selected else "▫️ ") + title, 60),
-                               f"chtg:{target}:{value}:{page}")]
-                for value, title in options[page * CHAT_PAGE_SIZE:(page + 1) * CHAT_PAGE_SIZE]]
+        rows = []
+        for index in range(page * CHAT_PAGE_SIZE, min(len(options), (page + 1) * CHAT_PAGE_SIZE)):
+            value, title = options[index]
+            data = f"chtg:{target}:{value}:{page}"
+            if len(data.encode()) > 64:  # лимит Telegram на данные кнопки — тогда по номеру в списке
+                data = f"chti:{target}:{index}:{page}"
+            rows.append([Button.inline(short(("✅ " if value in selected else "▫️ ") + title, 60), data)])
+        self._picker_options[(event.sender_id, target)] = [value for value, _ in options]
         if pages > 1:
             nav = []
             if page > 0:
@@ -323,13 +331,16 @@ class ControlBot:
             text += "\n\nНе нашёл групп и каналов, куда вы можете писать, — добавьте чат по ссылке."
         await self.reply(event, text, rows, edit=edit)
 
-    async def toggle_chat(self, event, arg: str) -> None:
+    async def toggle_chat(self, event, arg: str, *, by_index: bool = False) -> None:
         target, _, rest = arg.partition(":")
         value, _, page = rest.rpartition(":")
         selected = self.picker_selection(event, target)
+        if by_index:
+            options = self._picker_options.get((event.sender_id, target)) or []
+            value = options[int(value)] if value.isdigit() and int(value) < len(options) else ""
         if selected is None or not value:
             return await self.show_chat_picker(event, target)
-        chat = parse_chat(value)
+        chat = value if by_index else parse_chat(value)
         if chat in selected:
             selected.remove(chat)
         else:
@@ -407,8 +418,37 @@ class ControlBot:
         rows = [[Button.inline("📢 Выбрать канал", b"setchan")]]
         if channel is not None:
             rows[0].append(Button.inline("✖️ Без канала", b"nochan"))
+        pause = self.pause_label()
+        if pause:
+            text += f"\n\n⏸ <b>Рассылка на паузе</b> {pause}"
+            rows.append([Button.inline("▶️ Возобновить рассылку", b"pause:off")])
+        else:
+            text += "\n\n⏸ Рассылку можно поставить на паузу — выпуски на это время пропускаются."
+            rows.append([Button.inline("⏸ Пауза на 1 час", b"pause:1"), Button.inline("на 24 часа", b"pause:24"),
+                         Button.inline("до возобновления", b"pause:inf")])
         rows.append([Button.inline("« Меню", b"menu")])
         await self.reply(event, text, rows, edit=edit)
+
+    def pause_label(self) -> str | None:
+        settings = self.sender.settings
+        if settings is None or not settings.is_paused(datetime.now(self.cfg.tz)):
+            return None
+        until = settings.paused_until.astimezone(self.cfg.tz)
+        when = ("до возобновления" if until.year >= datetime.now(self.cfg.tz).year + 5
+                else f"до {until:%d.%m %H:%M}")
+        reason = f"\nПричина: {html.escape(settings.pause_reason)}" if settings.pause_reason else ""
+        return when + reason
+
+    async def set_pause(self, event, arg: str) -> None:
+        now = datetime.now(self.cfg.tz)
+        if arg == "off":
+            self.sender.settings.pause(None)
+            note = "▶️ Рассылка возобновлена"
+        else:
+            until = now + (timedelta(days=3650) if arg == "inf" else timedelta(hours=int(arg)))
+            self.sender.settings.pause(until, "поставлена на паузу вручную")
+            note = "⏸ Рассылка на паузе"
+        await self.show_settings(event, edit=True, note=note)
 
     async def ask_channel(self, event) -> None:
         self.states[event.sender_id] = {"step": "set_channel"}
@@ -472,6 +512,11 @@ class ControlBot:
             "📢 Канал для пересылки: " + (await self.chat_title_html(self.sender.channel)
                                           if self.sender.channel is not None else "не задан"),
             f"📋 Постов: {len(posts)}, активных: {len(active)}",
+        ]
+        pause = self.pause_label()
+        if pause:
+            lines.append(f"⏸ <b>Рассылка на паузе</b> {pause}")
+        lines += [
             "",
             "<b>⏭ Ближайшие публикации:</b>",
         ]
@@ -583,6 +628,8 @@ class ControlBot:
         """Карточка поста: (текст, текст без разметки на случай ошибки, кнопки)."""
         now = datetime.now(self.cfg.tz)
         pid = post["id"]
+        if note and len(note) > 900:
+            note = note[:900].rsplit("\n", 1)[0] + "\n…"
         lines = [note, ""] if note else []
         lines += [
             f"<b>📝 Пост #{pid}</b> — {'🟢 включён' if post['enabled'] else '⏸ выключен'}",
@@ -972,6 +1019,8 @@ class ControlBot:
         # список чатов с галочками (у черновика нового поста — без сброса диалога)
         if action == "chtg":
             return await self.toggle_chat(event, arg)
+        if action == "chti":
+            return await self.toggle_chat(event, arg, by_index=True)
         if action == "chpg":
             target, _, page = arg.partition(":")
             return await self.show_chat_picker(event, target, int(page) if page.isdigit() else 0)
@@ -1008,6 +1057,8 @@ class ControlBot:
             return await self.ask_channel(event)
         if action == "nochan":
             return await self.set_channel(event, None, edit=True)
+        if action == "pause" and arg in ("off", "1", "24", "inf"):
+            return await self.set_pause(event, arg)
         if action == "status":
             return await self.show_status(event, edit=True)
         if action == "list":
@@ -1047,12 +1098,11 @@ class ControlBot:
         elif action == "mix":
             post = self.store.update(pid, mix_letters=not post["mix_letters"])
             await event.answer("Подмена букв " + ("включена" if post["mix_letters"] else "выключена"))
-            note = await self.publish_to_channel(post)  # в канал уходит новая версия текста
-            await self.show_card(event, pid, edit=True, note=note.strip() or None)
+            # новая версия уйдёт в канал при следующей отправке — так частые переключения не плодят посты
+            await self.show_card(event, pid, edit=True)
         elif action == "via":
-            post = self.store.update(pid, via_channel=not post["via_channel"])
-            note = await self.publish_to_channel(post) if post["via_channel"] else ""
-            await self.show_card(event, pid, edit=True, note=note.strip() or None)
+            self.store.update(pid, via_channel=not post["via_channel"])
+            await self.show_card(event, pid, edit=True)
         elif action == "lp":
             self.store.update(pid, link_preview=not post["link_preview"])
             await self.show_card(event, pid, edit=True)
@@ -1067,7 +1117,11 @@ class ControlBot:
             how = " (пересылкой из канала)" if self.sender.uses_channel(post) else ""
             await self.reply(event, f"🚀 Опубликовать пост #{pid} в {label}{how} прямо сейчас?", buttons, edit=True)
         elif action == "sendok":
+            if pid in self._sending:
+                await event.answer("Уже отправляю этот пост…")
+                return
             await event.answer("Отправляю…")
+            self._sending.add(pid)
             try:
                 results = await self.sender.publish(post)
             except Exception as exc:
@@ -1078,6 +1132,8 @@ class ControlBot:
                     title = await self.chat_title_html(chat)
                     lines.append(f"✅ {title}" if exc is None else f"❌ {title}: {html.escape(describe_error(exc))}")
                 note = "🚀 Результат отправки:\n" + "\n".join(lines)
+            finally:
+                self._sending.discard(pid)
             await self.show_card(event, pid, note=note, edit=True)
         elif action == "test":
             await self.preview(event, post)

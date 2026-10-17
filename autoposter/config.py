@@ -31,6 +31,7 @@ class Config:
     posts_file: Path
     data_dir: Path
     channel: str | int | None = None
+    pause_between_chats: tuple[float, float] = (5.0, 15.0)
 
     @property
     def settings_file(self) -> Path:
@@ -88,6 +89,19 @@ def _int(name: str, default: int) -> int:
         raise ConfigError(f"{name} должен быть числом, а не {raw!r}") from None
 
 
+def _range(name: str, default: tuple[float, float]) -> tuple[float, float]:
+    """'5-15' -> (5.0, 15.0) секунд; одно число — фиксированная пауза."""
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    match = re.fullmatch(r"(\d+(?:\.\d+)?)\s*(?:-\s*(\d+(?:\.\d+)?))?", raw)
+    if not match:
+        raise ConfigError(f"{name}: ожидается число секунд или диапазон вроде 5-15, а не {raw!r}")
+    low = float(match[1])
+    high = float(match[2]) if match[2] else low
+    return (min(low, high), max(low, high))
+
+
 def _bool(name: str, default: bool) -> bool:
     raw = os.getenv(name, "").strip().lower()
     if not raw:
@@ -143,4 +157,5 @@ def load_config() -> Config:
         posts_file=posts_file,
         data_dir=data_dir,
         channel=parse_chat(os.getenv("CHANNEL", "")),
+        pause_between_chats=_range("PAUSE_BETWEEN_CHATS", (5.0, 15.0)),
     )

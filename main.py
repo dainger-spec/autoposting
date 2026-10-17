@@ -17,7 +17,7 @@ from autoposter.auth import has_console, load_owner, login_user, save_owner
 from autoposter.bot import ControlBot
 from autoposter.botlogin import BotLogin
 from autoposter.config import Config, ConfigError, load_config
-from autoposter.scheduler import Scheduler
+from autoposter.scheduler import FatalSessionError, Scheduler
 from autoposter.sender import Sender
 from autoposter.settings import Settings
 from autoposter.storage import PostStore
@@ -59,7 +59,8 @@ async def run(cfg: Config) -> None:
 
     try:
         settings = Settings(cfg.settings_file, cfg.channel)
-        sender = Sender(user, cfg.default_chat, store, settings)
+        sender = Sender(user, cfg.default_chat, store, settings, cfg.pause_between_chats)
+        sender.tz = cfg.tz
         await sender.attach_bot(me, bot_me, bot)
         admins = {me.id, *cfg.admin_ids} | ({owner_id} if owner_id else set())
         control = ControlBot(bot, cfg, store, sender, admins=admins)
@@ -68,11 +69,20 @@ async def run(cfg: Config) -> None:
 
         log.info("Аккаунт: %s (id %s). Бот управления: @%s", me.first_name, me.id, bot_me.username)
         log.info("Откройте @%s в Telegram и отправьте /start", bot_me.username)
-        await asyncio.gather(
-            scheduler.run(),
-            user.run_until_disconnected(),
-            bot.run_until_disconnected(),
-        )
+        # Если что-то одно остановилось (сессию аккаунта завершили, соединение закрыто),
+        # завершаемся целиком: хостинг перезапустит скрипт, и он попросит войти заново.
+        tasks = [asyncio.ensure_future(t) for t in (
+            scheduler.run(), user.run_until_disconnected(), bot.run_until_disconnected())]
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for task in pending:
+            task.cancel()
+        for task in done:
+            if task.exception():
+                raise task.exception()
+        raise ConfigError("соединение с Telegram закрыто — перезапустите скрипт")
+    except FatalSessionError as exc:
+        log.error("Аккаунт больше не работает: %s", exc)
+        raise SystemExit(2)
     finally:
         await bot.disconnect()
         await user.disconnect()
