@@ -7,6 +7,7 @@ import logging
 import math
 import re
 import shutil
+import time
 import uuid
 from collections import Counter
 from datetime import datetime
@@ -15,7 +16,7 @@ from pathlib import Path
 from telethon import Button, TelegramClient, errors, events, functions, types, utils
 from telethon.extensions import html as tl_html
 
-from .config import BASE_DIR, Config
+from .config import BASE_DIR, Config, parse_chat
 from .schedule import (ALL_DAYS, DAY_NAMES, PERIODS, WEEKDAYS, WEEKEND, format_days, format_until,
                        format_when, is_expired, next_run, parse_date, parse_times, period_end, until_date)
 from .sender import Sender, SendError, describe_error, send_post
@@ -24,6 +25,7 @@ from .storage import PostStore
 log = logging.getLogger(__name__)
 
 PAGE_SIZE = 8
+CHAT_PAGE_SIZE = 15
 LIST_VIEWS = {"all": "Все", "on": "🟢 Вкл", "off": "⏸ Выкл"}
 BODY_PREVIEW_LIMIT = 3000
 
@@ -62,8 +64,8 @@ TIMES_PROMPT = (
     "Можно несколько раз в день — через запятую: <code>09:00, 14:30, 21:00</code>"
 )
 CHAT_PROMPT = (
-    "💬 <b>Куда публиковать?</b>\n\n"
-    "Выберите кнопкой или пришлите сообщением:\n"
+    "➕ <b>Чат, которого нет в списке</b>\n\n"
+    "Пришлите сообщением:\n"
     "• @username группы или канала;\n"
     "• ссылку <code>https://t.me/...</code>;\n"
     "• ID чата, например <code>-1001234567890</code>.\n\n"
@@ -193,6 +195,8 @@ class ControlBot:
         self.admins = set(admins)
         # Пошаговые диалоги: {user_id: {"step": ..., "post_id": ..., "draft": {...}}}
         self.states: dict[int, dict] = {}
+        self._dialogs: list | None = None
+        self._dialogs_at = 0.0
 
     async def setup(self) -> None:
         self.bot.parse_mode = "html"
@@ -259,26 +263,99 @@ class ControlBot:
         """Чаты поста как явный список (чат по умолчанию тоже становится его частью)."""
         return list(post["chats"]) or ([self.cfg.default_chat] if self.cfg.default_chat is not None else [])
 
-    async def show_chats(self, event, post: dict, *, edit: bool = True, note: str | None = None) -> None:
-        pid, chats = post["id"], post["chats"]
-        lines = [note, ""] if note else []
-        lines.append(f"💬 <b>Чаты поста #{pid}</b>")
-        how = ("Один и тот же пост из канала пересылается в каждый из этих чатов по расписанию."
-               if self.sender.uses_channel(post) else "Пост отправляется в каждый из этих чатов по расписанию.")
-        lines += [how, ""]
-        rows = []
-        if chats:
-            for i, chat in enumerate(chats):
-                title = await self.sender.title(chat) or str(chat)
-                lines.append(f"{i + 1}. {html.escape(title)}")
-                rows.append([Button.inline(short(f"❌ Убрать: {title}", 60), f"chrm:{pid}:{i}")])
-        elif self.cfg.default_chat is not None:
-            lines.append(f"Сейчас — чат по умолчанию: {await self.chat_title_html(self.cfg.default_chat)}")
+    async def cached_dialogs(self, *, refresh: bool = False) -> list[tuple[int, str]]:
+        """Группы и каналы аккаунта; список кешируется на 5 минут, чтобы галочки ставились быстро."""
+        if refresh or self._dialogs is None or time.monotonic() - self._dialogs_at > 300:
+            self._dialogs = await self.sender.writable_dialogs(limit=100)
+            self._dialogs_at = time.monotonic()
+        return self._dialogs
+
+    def picker_selection(self, event, target: str) -> list | None:
+        """Выбранные чаты: черновика нового поста (target="new") или существующего поста."""
+        if target == "new":
+            state = self.states.get(event.sender_id)
+            return state["draft"]["chats"] if state and state["step"] == "new_chat" else None
+        post = self.store.get(int(target)) if target.isdigit() else None
+        return self.post_chats(post) if post else None
+
+    async def show_chat_picker(self, event, target: str, page: int = 0, *,
+                               edit: bool = True, note: str | None = None) -> None:
+        selected = self.picker_selection(event, target)
+        if selected is None:
+            if hasattr(event, "answer"):
+                await event.answer("Эта кнопка устарела", alert=True)
+            return await self.show_list(event, edit=edit)
+
+        dialogs = await self.cached_dialogs()
+        known = {peer for peer, _ in dialogs}
+        # отмеченные вручную (по ссылке, @username) и «Избранное» тоже показываем в списке
+        extra = [(c, await self.sender.title(c) or str(c)) for c in selected if c not in known and c != "me"]
+        options = extra + list(dialogs) + [("me", "Избранное (для проверки)")]
+
+        pages = max(1, math.ceil(len(options) / CHAT_PAGE_SIZE))
+        page = min(max(page, 0), pages - 1)
+        rows = [[Button.inline(short(("✅ " if value in selected else "▫️ ") + title, 60),
+                               f"chtg:{target}:{value}:{page}")]
+                for value, title in options[page * CHAT_PAGE_SIZE:(page + 1) * CHAT_PAGE_SIZE]]
+        if pages > 1:
+            nav = []
+            if page > 0:
+                nav.append(Button.inline("◀️", f"chpg:{target}:{page - 1}"))
+            nav.append(Button.inline(f"{page + 1} / {pages}", b"noop"))
+            if page < pages - 1:
+                nav.append(Button.inline("▶️", f"chpg:{target}:{page + 1}"))
+            rows.append(nav)
+        rows.append([Button.inline("➕ По ссылке или @username", f"chadd:{target}"),
+                     Button.inline("🔄 Обновить", f"chref:{target}:{page}")])
+
+        if target == "new":
+            head = "💬 <b>Куда публиковать?</b>\nОтметьте чаты галочкой — можно сразу несколько."
+            rows.append([Button.inline("Далее ➡️", b"chok:new")])
+            rows += cancel_buttons()
         else:
-            lines.append("⚠️ Пока не выбран ни один чат.")
-        rows.append([Button.inline("➕ Добавить чат", f"edit:{pid}:chat")])
-        rows.append([Button.inline("« К посту", f"post:{pid}")])
-        await self.reply(event, "\n".join(lines), rows, edit=edit)
+            post = self.store.get(int(target))
+            how = ("Один и тот же пост из канала пересылается в каждый отмеченный чат."
+                   if self.sender.uses_channel(post) else "Пост отправляется в каждый отмеченный чат.")
+            head = f"💬 <b>Чаты поста #{target}</b>\n{how}\nНажмите на чат, чтобы поставить или снять галочку."
+            rows.append([Button.inline("✅ Готово", f"post:{target}")])
+        text = (f"{note}\n\n" if note else "") + head + f"\n\nВыбрано: <b>{len(selected)}</b>"
+        if not dialogs:
+            text += "\n\nНе нашёл групп и каналов, куда вы можете писать, — добавьте чат по ссылке."
+        await self.reply(event, text, rows, edit=edit)
+
+    async def toggle_chat(self, event, arg: str) -> None:
+        target, _, rest = arg.partition(":")
+        value, _, page = rest.rpartition(":")
+        selected = self.picker_selection(event, target)
+        if selected is None or not value:
+            return await self.show_chat_picker(event, target)
+        chat = parse_chat(value)
+        if chat in selected:
+            selected.remove(chat)
+        else:
+            selected.append(chat)
+        if target != "new":
+            self.store.update(int(target), chats=selected)
+        await self.show_chat_picker(event, target, int(page) if page.isdigit() else 0)
+
+    async def finish_chat_step(self, event) -> None:
+        state = self.states.get(event.sender_id)
+        if not state or state["step"] != "new_chat":
+            await event.answer("Эта кнопка устарела", alert=True)
+            return
+        if not state["draft"]["chats"]:
+            await event.answer("Отметьте хотя бы один чат", alert=True)
+            return
+        state["step"] = "new_until"
+        await self.ask_until(event, edit=True)
+
+    async def ask_chat_link(self, event, target: str) -> None:
+        if target == "new":
+            back = b"chpg:new:0"
+        else:
+            self.states[event.sender_id] = {"step": "add_chat", "post_id": int(target)}
+            back = f"chats:{target}"
+        await self.reply(event, CHAT_PROMPT, [[Button.inline("« Назад к списку", back)]], edit=True)
 
     async def download(self, msg) -> dict:
         folder = self.cfg.media_dir / uuid.uuid4().hex
@@ -600,16 +677,6 @@ class ControlBot:
                 "Нажимайте на дни, чтобы включить или выключить их.")
         await self.reply(event, text, rows, edit=True)
 
-    async def ask_chat(self, event, *, edit: bool = False, prefix: str = "") -> None:
-        rows = []
-        if self.cfg.default_chat is not None:
-            title = await self.sender.title(self.cfg.default_chat) or str(self.cfg.default_chat)
-            rows.append([Button.inline(short(f"⭐️ По умолчанию: {title}", 60), b"chat:default")])
-        rows.append([Button.inline("📂 Выбрать из моих чатов", b"pick")])
-        rows.append([Button.inline("📌 Избранное (для проверки)", b"chat:me")])
-        rows += cancel_buttons()
-        await self.reply(event, prefix + CHAT_PROMPT, rows, edit=edit)
-
     # ── сообщения ─────────────────────────────────────────────────
 
     @guarded
@@ -773,8 +840,9 @@ class ControlBot:
             return
         if state["step"] == "new_times":
             state["draft"]["times"] = times
+            state["draft"]["chats"] = [self.cfg.default_chat] if self.cfg.default_chat is not None else []
             state["step"] = "new_chat"
-            return await self.ask_chat(event)
+            return await self.show_chat_picker(event, "new", edit=False)
         self.states.pop(event.sender_id, None)
         self.store.update(state["post_id"], times=times)
         await self.show_card(event, state["post_id"], note="✅ Время обновлено")
@@ -800,38 +868,28 @@ class ControlBot:
         await self.show_card(event, post["id"], note=note)
 
     async def handle_chat_text(self, event, state: dict, text: str) -> None:
+        target = "new" if state["step"] == "new_chat" else str(state["post_id"])
         if not text:
-            return await self.ask_chat(event)
+            return await self.show_chat_picker(event, target, edit=False)
         try:
             chat, _ = await self.sender.lookup(text)
         except Exception as exc:
             await event.respond(
                 f"❌ Не получилось найти чат: {html.escape(describe_error(exc))}\n"
                 "Проверьте написание и что ваш аккаунт состоит в этом чате.",
-                buttons=cancel_buttons())
+                buttons=[[Button.inline("« Назад к списку", f"chpg:{target}:0" if target == "new"
+                                        else f"chats:{target}")]])
             return
-        await self.apply_chat(event, state, chat)
-
-    async def apply_chat(self, event, state: dict, chat, *, edit: bool = False) -> None:
-        self.states.pop(event.sender_id, None)
-        if state["step"] == "new_chat":
-            state["draft"]["chats"] = [] if chat is None else [chat]
-            state["step"] = "new_until"
-            self.states[event.sender_id] = state
-            return await self.ask_until(event, edit=edit)
-        # добавление ещё одного чата к посту
-        post = self.store.get(state["post_id"])
-        if post is None:
-            return await self.show_list(event, edit=edit, note="⚠️ Пост не найден — возможно, его удалили.")
-        chats = self.post_chats(post)
-        value = self.cfg.default_chat if chat is None else chat
-        if value in chats:
-            note = "ℹ️ Этот чат уже есть в списке"
-        else:
-            chats.append(value)
-            note = f"✅ Чат добавлен: {await self.chat_title_html(value)}"
-        post = self.store.update(post["id"], chats=chats)
-        await self.show_chats(event, post, edit=edit, note=note)
+        selected = self.picker_selection(event, target)
+        if selected is None:
+            return await self.show_list(event, note="⚠️ Пост не найден — возможно, его удалили.")
+        if chat not in selected:
+            selected.append(chat)
+        if target != "new":
+            self.states.pop(event.sender_id, None)
+            self.store.update(int(target), chats=selected)
+        await self.show_chat_picker(event, target, edit=False,
+                                    note=f"✅ Отмечен: {await self.chat_title_html(chat)}")
 
     async def ask_until(self, event, *, edit: bool = False, prefix: str = "") -> None:
         codes = list(PERIODS)
@@ -911,10 +969,21 @@ class ControlBot:
             return
         if action == "cancel":
             return await self.cancel(event, edit=True)
-        if action == "pick":
-            return await self.pick_chat(event)
-        if action == "chat":
-            return await self.choose_chat(event, arg)
+        # список чатов с галочками (у черновика нового поста — без сброса диалога)
+        if action == "chtg":
+            return await self.toggle_chat(event, arg)
+        if action == "chpg":
+            target, _, page = arg.partition(":")
+            return await self.show_chat_picker(event, target, int(page) if page.isdigit() else 0)
+        if action == "chref":
+            target, _, page = arg.partition(":")
+            await event.answer("Обновляю список чатов…")
+            await self.cached_dialogs(refresh=True)
+            return await self.show_chat_picker(event, target, int(page) if page.isdigit() else 0)
+        if action == "chadd":
+            return await self.ask_chat_link(event, arg)
+        if action == "chok":
+            return await self.finish_chat_step(event)
         if action == "until":
             return await self.choose_until(event, arg)
         if action == "chan":
@@ -988,18 +1057,7 @@ class ControlBot:
             self.store.update(pid, link_preview=not post["link_preview"])
             await self.show_card(event, pid, edit=True)
         elif action == "chats":
-            await self.show_chats(event, post)
-        elif action == "chrm":
-            chats = self.post_chats(post)
-            if extra.isdigit() and int(extra) < len(chats):
-                removed = chats.pop(int(extra))
-                post = self.store.update(pid, chats=chats)
-                note = f"🗑 Чат убран: {await self.chat_title_html(removed)}"
-                if not chats:
-                    note += "\n⚠️ Чатов не осталось — пост пойдёт в чат по умолчанию, если он задан."
-                await self.show_chats(event, post, note=note)
-            else:
-                await self.show_chats(event, post)
+            await self.show_chat_picker(event, str(pid))
         elif action == "send":
             if not self.sender.targets(post):
                 await event.answer("Сначала выберите чат для поста", alert=True)
@@ -1069,8 +1127,7 @@ class ControlBot:
             text = f"Сейчас: <b>{current}</b>\n\n" + TIMES_PROMPT.format(tz=self.cfg.tz.key)
             await self.reply(event, text, cancel_buttons(), edit=True)
         elif field == "chat":
-            self.states[user_id] = {"step": "add_chat", "post_id": pid}
-            await self.ask_chat(event, edit=True, prefix=f"➕ <b>Новый чат для поста #{pid}</b>\n\n")
+            await self.show_chat_picker(event, str(pid))
         elif field == "days":
             await self.show_days(event, post)
         elif field == "buttons":
@@ -1092,34 +1149,3 @@ class ControlBot:
             await event.respond(f"❌ Превью не получилось: {html.escape(describe_error(exc))}")
         await self.show_card(event, post["id"])
 
-    async def pick_chat(self, event) -> None:
-        state = self.states.get(event.sender_id)
-        if not state or not state["step"].endswith("chat"):
-            await event.answer("Эта кнопка устарела", alert=True)
-            return
-        await event.answer("Загружаю ваши чаты…")
-        dialogs = await self.sender.writable_dialogs()
-        rows = [[Button.inline(short(title, 50), f"chat:{peer_id}")] for peer_id, title in dialogs]
-        rows += cancel_buttons()
-        if dialogs:
-            text = ("📂 <b>Ваши группы и каналы</b>, куда можно публиковать.\n"
-                    "Нужного нет? Пришлите его @username или ID сообщением.")
-        else:
-            text = "Не нашёл групп и каналов, куда вы можете писать. Пришлите @username или ID чата сообщением."
-        await self.reply(event, text, rows, edit=True)
-
-    async def choose_chat(self, event, arg: str) -> None:
-        state = self.states.get(event.sender_id)
-        if not state or not state["step"].endswith("chat"):
-            await event.answer("Эта кнопка устарела", alert=True)
-            return
-        if arg == "default":
-            chat = None
-        elif arg == "me":
-            chat = "me"
-        else:
-            try:
-                chat = int(arg)
-            except ValueError:
-                return
-        await self.apply_chat(event, state, chat, edit=True)
