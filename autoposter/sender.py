@@ -240,8 +240,11 @@ class Sender:
             result["media"] = [found[i].media for i in src["media_ids"]]
         return result
 
-    def target(self, post: dict):
-        return post["chat"] if post["chat"] is not None else self.default_chat
+    def targets(self, post: dict) -> list:
+        """Чаты, куда идёт пост; если у поста их нет — чат по умолчанию."""
+        if post["chats"]:
+            return list(post["chats"])
+        return [self.default_chat] if self.default_chat is not None else []
 
     async def _input_entity(self, chat):
         try:
@@ -266,13 +269,25 @@ class Sender:
         info = post.get("channel_post")
         return bool(info) and info["chat"] == self.channel and info["key"] == content_key(post)
 
-    async def publish(self, post: dict):
-        """Публикация по расписанию: напрямую в чат или пересылкой из канала."""
-        if not self.uses_channel(post):
-            return await self.send(post)
-        chat = self.target(post)
-        if chat is None:
+    async def publish(self, post: dict) -> list[tuple]:
+        """Публикует пост во все его чаты. Возвращает [(чат, ошибка или None)]."""
+        targets = self.targets(post)
+        if not targets:
             raise SendError("не указан чат: выберите его в посте или задайте DEFAULT_CHAT в .env")
+        results = []
+        for chat in targets:
+            try:
+                await self.publish_to(post, chat)
+                results.append((chat, None))
+            except Exception as exc:
+                log.warning("Пост #%s → %s: %s", post["id"], chat, describe_error(exc))
+                results.append((chat, exc))
+        return results
+
+    async def publish_to(self, post: dict, chat):
+        """Публикация в один чат: напрямую или пересылкой одного и того же сообщения из канала."""
+        if not self.uses_channel(post):
+            return await self.send(post, chat)
         target = await self._input_entity(chat)
         info = await self.ensure_channel_post(post)
         try:
@@ -329,10 +344,7 @@ class Sender:
             return await self.client.forward_messages(target, info["ids"], from_peer=channel,
                                                       silent=post["silent"])
 
-    async def send(self, post: dict):
-        chat = self.target(post)
-        if chat is None:
-            raise SendError("не указан чат: выберите его в посте или задайте DEFAULT_CHAT в .env")
+    async def send(self, post: dict, chat):
         entity = await self._input_entity(chat)
         source = await self.load_source(post)
         try:

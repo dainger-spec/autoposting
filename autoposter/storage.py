@@ -66,17 +66,26 @@ def normalize_post(raw: dict, post_id: int) -> dict:
         kind = item.get("type") if item.get("type") in MEDIA_TYPES else "auto"
         media.append({"file": str(item["file"]), "type": kind})
 
-    chat = raw.get("chat")
-    if isinstance(chat, str):
-        chat = parse_chat(chat)
-    elif isinstance(chat, bool) or not isinstance(chat, int):
-        chat = None
+    # Чаты публикации: "chats": [...]; старый формат "chat": одно значение. Пусто — DEFAULT_CHAT.
+    raw_chats = raw.get("chats")
+    if raw_chats is None:
+        raw_chats = [raw.get("chat")]
+    elif not isinstance(raw_chats, list):
+        raw_chats = [raw_chats]
+    chats = []
+    for chat in raw_chats:
+        if isinstance(chat, str):
+            chat = parse_chat(chat)
+        elif isinstance(chat, bool) or not isinstance(chat, int):
+            chat = None
+        if chat is not None and chat not in chats:
+            chats.append(chat)
 
     return {
         "id": post_id,
         "text": str(raw.get("text") or ""),
         "media": media,
-        "chat": chat,
+        "chats": chats,
         "times": sorted(times),
         "days": sorted(days),
         "enabled": bool(raw.get("enabled", True)),
@@ -268,11 +277,12 @@ class PostStore:
     def _save_state(self) -> None:
         _write_json(self.state_file, {"sent": self._sent})
 
-    def was_sent(self, post_id: int, day: str, hhmm: str) -> bool:
-        return f"{day} {hhmm}" in self._sent.get(str(post_id), ())
+    def was_sent(self, post_id: int, day: str, hhmm: str, chat) -> bool:
+        return f"{day} {hhmm} {chat}" in self._sent.get(str(post_id), ())
 
-    def mark_sent(self, post_id: int, day: str, hhmm: str) -> None:
-        self._sent.setdefault(str(post_id), []).append(f"{day} {hhmm}")
+    def mark_sent(self, post_id: int, day: str, hhmm: str, chat) -> None:
+        """Отметка ставится отдельно для каждого чата: сбой в одном не мешает остальным."""
+        self._sent.setdefault(str(post_id), []).append(f"{day} {hhmm} {chat}")
         # старые отметки не нужны: хранится только пара последних дней
         cutoff = (date.today() - timedelta(days=3)).isoformat()
         self._sent = {

@@ -3,28 +3,56 @@
     {
       "id": 1,
       "text": "<b>Доброе утро!</b> ☀️\nСвежие новости уже на <a href=\"https://example.com\">нашем сайте</a>.",
-      "times": ["09:00"],
-      "days": [1, 2, 3, 4, 5, 6, 7],
-      "chat": null,
-      "enabled": true
+      "times": [
+        "09:00"
+      ],
+      "days": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "enabled": true,
+      "chats": []
     },
     {
       "id": 2,
       "text": "Напоминание: созвон в 19:00 📞",
-      "times": ["12:00", "18:30"],
-      "days": ["пн", "ср", "пт"],
-      "chat": "@my_chat",
+      "times": [
+        "12:00",
+        "18:30"
+      ],
+      "days": [
+        "пн",
+        "ср",
+        "пт"
+      ],
       "silent": true,
-      "enabled": true
+      "enabled": true,
+      "chats": [
+        "@my_chat",
+        "@second_chat"
+      ]
     },
     {
       "id": 3,
       "text": "<b>Итоги недели</b> 📊",
-      "media": ["images/week.jpg"],
-      "times": ["20:00"],
-      "days": [7],
-      "chat": -1001234567890,
-      "enabled": false
+      "media": [
+        "images/week.jpg"
+      ],
+      "times": [
+        "20:00"
+      ],
+      "days": [
+        7
+      ],
+      "enabled": false,
+      "chats": [
+        -1001234567890
+      ]
     }
   ]
 }

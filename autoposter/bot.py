@@ -248,12 +248,37 @@ class ControlBot:
             return f"⚠️ {html.escape(str(chat))} (не найден)"
         return html.escape(title)
 
-    async def chat_label(self, chat) -> str:
-        if chat is not None:
-            return await self.chat_title_html(chat)
+    async def chats_label(self, post: dict) -> str:
+        if post["chats"]:
+            return ", ".join([await self.chat_title_html(c) for c in post["chats"]])
         if self.cfg.default_chat is None:
             return "⚠️ не выбран"
         return f"по умолчанию — {await self.chat_title_html(self.cfg.default_chat)}"
+
+    def post_chats(self, post: dict) -> list:
+        """Чаты поста как явный список (чат по умолчанию тоже становится его частью)."""
+        return list(post["chats"]) or ([self.cfg.default_chat] if self.cfg.default_chat is not None else [])
+
+    async def show_chats(self, event, post: dict, *, edit: bool = True, note: str | None = None) -> None:
+        pid, chats = post["id"], post["chats"]
+        lines = [note, ""] if note else []
+        lines.append(f"💬 <b>Чаты поста #{pid}</b>")
+        how = ("Один и тот же пост из канала пересылается в каждый из этих чатов по расписанию."
+               if self.sender.uses_channel(post) else "Пост отправляется в каждый из этих чатов по расписанию.")
+        lines += [how, ""]
+        rows = []
+        if chats:
+            for i, chat in enumerate(chats):
+                title = await self.sender.title(chat) or str(chat)
+                lines.append(f"{i + 1}. {html.escape(title)}")
+                rows.append([Button.inline(short(f"❌ Убрать: {title}", 60), f"chrm:{pid}:{i}")])
+        elif self.cfg.default_chat is not None:
+            lines.append(f"Сейчас — чат по умолчанию: {await self.chat_title_html(self.cfg.default_chat)}")
+        else:
+            lines.append("⚠️ Пока не выбран ни один чат.")
+        rows.append([Button.inline("➕ Добавить чат", f"edit:{pid}:chat")])
+        rows.append([Button.inline("« К посту", f"post:{pid}")])
+        await self.reply(event, "\n".join(lines), rows, edit=edit)
 
     async def download(self, msg) -> dict:
         folder = self.cfg.media_dir / uuid.uuid4().hex
@@ -484,7 +509,7 @@ class ControlBot:
         lines = [note, ""] if note else []
         lines += [
             f"<b>📝 Пост #{pid}</b> — {'🟢 включён' if post['enabled'] else '⏸ выключен'}",
-            f"💬 Чат: {await self.chat_label(post['chat'])}",
+            f"💬 Чаты: {await self.chats_label(post)}",
             f"⏰ Время: {', '.join(post['times']) or '⚠️ не задано'}",
             f"📅 Дни: {format_days(post['days'])}",
             f"⏳ Срок: {format_until(post, now.date())}",
@@ -527,7 +552,7 @@ class ControlBot:
             [Button.inline("⏰ Время", f"edit:{pid}:times"),
              Button.inline("📅 Дни", f"edit:{pid}:days")],
             [Button.inline("⏳ Срок", f"edit:{pid}:until"),
-             Button.inline("💬 Чат", f"edit:{pid}:chat")],
+             Button.inline(f"💬 Чаты ({len(self.post_chats(post))})", f"chats:{pid}")],
             [Button.inline("🔘 Кнопки", f"edit:{pid}:buttons"),
              Button.inline("🔕 Без звука" if post["silent"] else "🔔 Со звуком", f"silent:{pid}")],
         ]
@@ -575,7 +600,7 @@ class ControlBot:
                 "Нажимайте на дни, чтобы включить или выключить их.")
         await self.reply(event, text, rows, edit=True)
 
-    async def ask_chat(self, event, *, edit: bool = False) -> None:
+    async def ask_chat(self, event, *, edit: bool = False, prefix: str = "") -> None:
         rows = []
         if self.cfg.default_chat is not None:
             title = await self.sender.title(self.cfg.default_chat) or str(self.cfg.default_chat)
@@ -583,7 +608,7 @@ class ControlBot:
         rows.append([Button.inline("📂 Выбрать из моих чатов", b"pick")])
         rows.append([Button.inline("📌 Избранное (для проверки)", b"chat:me")])
         rows += cancel_buttons()
-        await self.reply(event, CHAT_PROMPT, rows, edit=edit)
+        await self.reply(event, prefix + CHAT_PROMPT, rows, edit=edit)
 
     # ── сообщения ─────────────────────────────────────────────────
 
@@ -790,12 +815,23 @@ class ControlBot:
     async def apply_chat(self, event, state: dict, chat, *, edit: bool = False) -> None:
         self.states.pop(event.sender_id, None)
         if state["step"] == "new_chat":
-            state["draft"]["chat"] = chat
+            state["draft"]["chats"] = [] if chat is None else [chat]
             state["step"] = "new_until"
             self.states[event.sender_id] = state
             return await self.ask_until(event, edit=edit)
-        self.store.update(state["post_id"], chat=chat)
-        await self.show_card(event, state["post_id"], note="✅ Чат обновлён", edit=edit)
+        # добавление ещё одного чата к посту
+        post = self.store.get(state["post_id"])
+        if post is None:
+            return await self.show_list(event, edit=edit, note="⚠️ Пост не найден — возможно, его удалили.")
+        chats = self.post_chats(post)
+        value = self.cfg.default_chat if chat is None else chat
+        if value in chats:
+            note = "ℹ️ Этот чат уже есть в списке"
+        else:
+            chats.append(value)
+            note = f"✅ Чат добавлен: {await self.chat_title_html(value)}"
+        post = self.store.update(post["id"], chats=chats)
+        await self.show_chats(event, post, edit=edit, note=note)
 
     async def ask_until(self, event, *, edit: bool = False, prefix: str = "") -> None:
         codes = list(PERIODS)
@@ -837,9 +873,9 @@ class ControlBot:
         if state["step"] == "new_until":
             draft = state["draft"]
             post = self.store.add(text=draft["text"], media=draft["media"], times=draft["times"],
-                                  chat=draft["chat"], source=draft.get("source"), until=value)
-            note = ("✅ Пост создан и включён. Дни недели, кнопки со ссылками и остальное "
-                    "можно настроить кнопками ниже.")
+                                  chats=draft["chats"], source=draft.get("source"), until=value)
+            note = ("✅ Пост создан и включён. Дни недели, дополнительные чаты, кнопки со ссылками "
+                    "и остальное можно настроить кнопками ниже.")
             if post["source"]:
                 note += "\n📨 Не удаляйте исходное сообщение из этого чата: пост копируется из него."
             note += await self.publish_to_channel(post)
@@ -951,22 +987,39 @@ class ControlBot:
         elif action == "lp":
             self.store.update(pid, link_preview=not post["link_preview"])
             await self.show_card(event, pid, edit=True)
+        elif action == "chats":
+            await self.show_chats(event, post)
+        elif action == "chrm":
+            chats = self.post_chats(post)
+            if extra.isdigit() and int(extra) < len(chats):
+                removed = chats.pop(int(extra))
+                post = self.store.update(pid, chats=chats)
+                note = f"🗑 Чат убран: {await self.chat_title_html(removed)}"
+                if not chats:
+                    note += "\n⚠️ Чатов не осталось — пост пойдёт в чат по умолчанию, если он задан."
+                await self.show_chats(event, post, note=note)
+            else:
+                await self.show_chats(event, post)
         elif action == "send":
-            if self.sender.target(post) is None:
+            if not self.sender.targets(post):
                 await event.answer("Сначала выберите чат для поста", alert=True)
                 return
-            label = await self.chat_label(post["chat"])
+            label = await self.chats_label(post)
             buttons = [[Button.inline("✅ Да, отправить", f"sendok:{pid}"), Button.inline("« Назад", f"post:{pid}")]]
             how = " (пересылкой из канала)" if self.sender.uses_channel(post) else ""
             await self.reply(event, f"🚀 Опубликовать пост #{pid} в {label}{how} прямо сейчас?", buttons, edit=True)
         elif action == "sendok":
             await event.answer("Отправляю…")
             try:
-                await self.sender.publish(post)
+                results = await self.sender.publish(post)
             except Exception as exc:
                 note = f"❌ Не удалось отправить: {html.escape(describe_error(exc))}"
             else:
-                note = "✅ Пост опубликован"
+                lines = []
+                for chat, exc in results:
+                    title = await self.chat_title_html(chat)
+                    lines.append(f"✅ {title}" if exc is None else f"❌ {title}: {html.escape(describe_error(exc))}")
+                note = "🚀 Результат отправки:\n" + "\n".join(lines)
             await self.show_card(event, pid, note=note, edit=True)
         elif action == "test":
             await self.preview(event, post)
@@ -1016,8 +1069,8 @@ class ControlBot:
             text = f"Сейчас: <b>{current}</b>\n\n" + TIMES_PROMPT.format(tz=self.cfg.tz.key)
             await self.reply(event, text, cancel_buttons(), edit=True)
         elif field == "chat":
-            self.states[user_id] = {"step": "edit_chat", "post_id": pid}
-            await self.ask_chat(event, edit=True)
+            self.states[user_id] = {"step": "add_chat", "post_id": pid}
+            await self.ask_chat(event, edit=True, prefix=f"➕ <b>Новый чат для поста #{pid}</b>\n\n")
         elif field == "days":
             await self.show_days(event, post)
         elif field == "buttons":
