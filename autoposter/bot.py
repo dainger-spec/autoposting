@@ -368,6 +368,10 @@ class ControlBot:
             back = f"chats:{target}"
         await self.reply(event, CHAT_PROMPT, [[Button.inline("« Назад к списку", back)]], edit=True)
 
+    def draft_media(self) -> list[dict]:
+        """Файлы черновиков, которые сейчас набираются в чате с ботом."""
+        return [m for st in self.states.values() for m in (st.get("draft") or {}).get("media") or []]
+
     async def download(self, msg) -> dict:
         folder = self.cfg.media_dir / uuid.uuid4().hex
         folder.mkdir(parents=True, exist_ok=True)

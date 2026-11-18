@@ -16,6 +16,7 @@ from telethon.sessions import StringSession
 from autoposter.auth import has_console, load_owner, login_user, save_owner
 from autoposter.bot import ControlBot
 from autoposter.botlogin import BotLogin
+from autoposter import maintenance
 from autoposter.config import Config, ConfigError, load_config
 from autoposter.scheduler import FatalSessionError, Scheduler
 from autoposter.sender import Sender
@@ -41,6 +42,9 @@ async def run(cfg: Config) -> None:
     # имя сессии бота привязано к его ID, чтобы смена BOT_TOKEN не подхватила старого бота
     bot_id = cfg.bot_token.split(":", 1)[0]
     bot = TelegramClient(str(cfg.data_dir / f"bot_{bot_id}"), cfg.api_id, cfg.api_hash)
+
+    # Чистим диск ещё до работы с Telegram: если он уже забит, иначе не стартуем.
+    maintenance.run_once(store, [c for c in (user, bot) if not isinstance(c.session, StringSession)])
 
     await bot.start(bot_token=cfg.bot_token)
     bot.parse_mode = "html"
@@ -72,7 +76,8 @@ async def run(cfg: Config) -> None:
         # Если что-то одно остановилось (сессию аккаунта завершили, соединение закрыто),
         # завершаемся целиком: хостинг перезапустит скрипт, и он попросит войти заново.
         tasks = [asyncio.ensure_future(t) for t in (
-            scheduler.run(), user.run_until_disconnected(), bot.run_until_disconnected())]
+            scheduler.run(), user.run_until_disconnected(), bot.run_until_disconnected(),
+            maintenance.loop(store, [user, bot], control.draft_media))]
         done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         for task in pending:
             task.cancel()

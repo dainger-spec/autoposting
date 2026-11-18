@@ -261,6 +261,32 @@ class PostStore:
             else:
                 path.unlink(missing_ok=True)
 
+    def cleanup_media(self, keep: list[dict] = ()) -> int:
+        """Удаляет из data/media файлы, на которые не ссылается ни один пост (и черновик из keep).
+
+        Такие файлы остаются от брошенных черновиков и перезапусков и со временем
+        забивают диск. Возвращает число удалённых файлов/папок.
+        """
+        if not self.media_dir.is_dir():
+            return 0
+        self.reload()
+        media_dir = self.media_dir.resolve()
+        in_use = {media_path(m["file"]).resolve()
+                  for m in [*(m for p in self._posts.values() for m in p["media"]), *keep]}
+        keep_dirs = {p.parent for p in in_use} | in_use
+        removed = 0
+        for entry in media_dir.iterdir():
+            if entry.resolve() in keep_dirs:
+                continue
+            if entry.is_dir():
+                shutil.rmtree(entry, ignore_errors=True)
+            else:
+                entry.unlink(missing_ok=True)
+            removed += 1
+        if removed:
+            log.info("Удалено неиспользуемых файлов из %s: %d", media_dir, removed)
+        return removed
+
     # ── отметки об отправке ────────────────────────────────────────
 
     def _load_state(self) -> dict[str, list[str]]:
