@@ -32,7 +32,7 @@ async def run(cfg: Config) -> None:
 
     # Две сессии: ваш аккаунт (от него идут посты) и бот (через него управление).
     # На хостинге без консоли вход в аккаунт задаётся строкой SESSION_STRING (см. login.py).
-    user_session = str(cfg.data_dir / "user")
+    user_session = maintenance.in_memory(str(cfg.data_dir / "user"))
     if cfg.session_string:
         try:
             user_session = StringSession(cfg.session_string)
@@ -41,7 +41,7 @@ async def run(cfg: Config) -> None:
     user = TelegramClient(user_session, cfg.api_id, cfg.api_hash)
     # имя сессии бота привязано к его ID, чтобы смена BOT_TOKEN не подхватила старого бота
     bot_id = cfg.bot_token.split(":", 1)[0]
-    bot = TelegramClient(str(cfg.data_dir / f"bot_{bot_id}"), cfg.api_id, cfg.api_hash)
+    bot = TelegramClient(maintenance.in_memory(str(cfg.data_dir / f"bot_{bot_id}")), cfg.api_id, cfg.api_hash)
 
     # Чистим диск ещё до работы с Telegram: если он уже забит, иначе не стартуем.
     maintenance.run_once(store, [c for c in (user, bot) if not isinstance(c.session, StringSession)])

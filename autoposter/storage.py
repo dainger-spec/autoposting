@@ -27,10 +27,16 @@ def media_path(file: str) -> Path:
 
 
 def _write_json(path: Path, data) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    os.replace(tmp, path)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError as exc:
+        # Нет места на диске и т.п.: не падаем — данные остаются в памяти,
+        # сохранятся при следующей записи, когда место появится.
+        tmp.unlink(missing_ok=True)
+        log.error("Не удалось сохранить %s: %s", path.name, exc)
 
 
 def normalize_post(raw: dict, post_id: int) -> dict:
@@ -207,7 +213,10 @@ class PostStore:
 
     def _save(self) -> None:
         _write_json(self.posts_file, {"posts": self.all()})
-        self._mtime = self.posts_file.stat().st_mtime_ns
+        try:
+            self._mtime = self.posts_file.stat().st_mtime_ns
+        except OSError:
+            pass
 
     def all(self) -> list[dict]:
         return [self._posts[i] for i in sorted(self._posts)]
